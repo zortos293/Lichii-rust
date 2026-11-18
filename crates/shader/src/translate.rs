@@ -105,6 +105,7 @@ pub fn translate_dual_vertex(
         &b.info,
         opt::storage_buffer_limit(options.profile),
     )?;
+    opt::mark_reach_feedback(&mut info, options.profile, env_b.is_native_program());
     let descriptors = opt::join_texture_info(&mut info, &b.info, &storage_bindings);
     opt::remap_texture_descriptors(&mut b.ir, &descriptors);
     opt::remap_storage_bindings(&mut b.ir, &storage_bindings);
@@ -394,6 +395,7 @@ fn optimize(
     opt::vendor_workaround(ir);
     collect_interpolation_info(env, info)?;
     add_nvn_storage_buffers(info, profile)?;
+    opt::mark_reach_feedback(info, profile, env.is_native_program());
     opt::limit_sampled_texture_arrays(ir, info, host)?;
     Ok(())
 }
@@ -475,6 +477,7 @@ fn add_nvn_storage_buffers(info: &mut ShaderInfo, profile: &Profile) -> Result<(
             .find(|d| d.cbuf_index == 0 && d.cbuf_offset == offset)
         {
             desc.is_written |= stores;
+            desc.read_extent = StorageWriteExtent::default();
             if stores {
                 desc.write_extent = StorageWriteExtent::default();
             }
@@ -493,6 +496,8 @@ fn add_nvn_storage_buffers(info: &mut ShaderInfo, profile: &Profile) -> Result<(
             is_written: stores,
             indirect_offset: StorageBufferDescriptor::DIRECT,
             write_extent: StorageWriteExtent::default(),
+            read_extent: StorageWriteExtent::default(),
+            reach_feedback: false,
         });
     }
     Ok(())

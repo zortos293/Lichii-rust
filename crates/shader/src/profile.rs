@@ -11,6 +11,12 @@ pub struct Profile {
     /// views of one binding). Without it constant buffers are read as vec4 arrays and storage
     /// buffers as words.
     pub support_descriptor_aliasing: bool,
+    /// Pipelines can make storage buffer accesses past the end of a binding read zero and write
+    /// nothing (pipeline robustness), so programs may report how far their storage pointers of
+    /// unknown reach go ([`StorageBufferDescriptor::reach_feedback`]).
+    ///
+    /// [`StorageBufferDescriptor::reach_feedback`]: crate::info::StorageBufferDescriptor::reach_feedback
+    pub support_reach_feedback: bool,
 
     pub support_int8: bool,
     pub support_int16: bool,
@@ -116,6 +122,7 @@ impl Default for Profile {
             supported_spirv: 0x0001_0300,
             unified_descriptor_binding: true,
             support_descriptor_aliasing: true,
+            support_reach_feedback: false,
             support_int8: false,
             support_int16: false,
             support_int64: false,

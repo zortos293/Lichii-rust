@@ -168,9 +168,11 @@ fn defined(func: Word) -> EmitResult<Word> {
 
 fn storage_atomic32(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> EmitResult<Word> {
     let value = ctx.def_arg(inst, 2)?;
-    let pointer = storage_pointer(ctx, inst, StorageElement::U32, 4, 0)?;
+    let (pointer, in_range) = storage_pointer(ctx, inst, StorageElement::U32, 4, 0)?;
     let u32_t = ctx.u32[1];
-    op.atomic(ctx, u32_t, pointer, value)
+    ctx.guarded_access(in_range, Some(u32_t), |ctx| {
+        op.atomic(ctx, u32_t, pointer, value)
+    })
 }
 
 fn storage_atomic64(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> EmitResult<Word> {
@@ -181,18 +183,22 @@ fn storage_atomic64(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> Em
     }
     let value = ctx.def_arg(inst, 2)?;
     if ctx.profile.support_int64_atomics {
-        let pointer = storage_pointer(ctx, inst, StorageElement::U64, 8, 0)?;
-        return op.atomic(ctx, u64_t, pointer, value);
+        let (pointer, in_range) = storage_pointer(ctx, inst, StorageElement::U64, 8, 0)?;
+        return ctx.guarded_access(in_range, Some(u64_t), |ctx| {
+            op.atomic(ctx, u64_t, pointer, value)
+        });
     }
     tracing::warn!("int64 atomics not supported, falling back to non-atomic");
     let u32x2 = ctx.u32[2];
-    let pointer = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
-    let words = ctx.b.load(u32x2, None, pointer, None, [])?;
-    let old = ctx.b.bitcast(u64_t, None, words)?;
-    let new = op.plain(ctx, u64_t, value, old)?;
-    let new_words = ctx.b.bitcast(u32x2, None, new)?;
-    ctx.b.store(pointer, new_words, None, [])?;
-    Ok(old)
+    let (pointer, in_range) = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
+    ctx.guarded_access(in_range, Some(u64_t), |ctx| {
+        let words = ctx.b.load(u32x2, None, pointer, None, [])?;
+        let old = ctx.b.bitcast(u64_t, None, words)?;
+        let new = op.plain(ctx, u64_t, value, old)?;
+        let new_words = ctx.b.bitcast(u32x2, None, new)?;
+        ctx.b.store(pointer, new_words, None, [])?;
+        Ok(old)
+    })
 }
 
 fn storage_atomic32x2(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> EmitResult<Word> {
@@ -203,11 +209,13 @@ fn storage_atomic32x2(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> 
     }
     tracing::warn!("int64 atomics not supported, falling back to non-atomic");
     let value = ctx.def_arg(inst, 2)?;
-    let pointer = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
-    let old = ctx.b.load(u32x2, None, pointer, None, [])?;
-    let new = op.plain(ctx, u32x2, value, old)?;
-    ctx.b.store(pointer, new, None, [])?;
-    Ok(old)
+    let (pointer, in_range) = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
+    ctx.guarded_access(in_range, Some(u32x2), |ctx| {
+        let old = ctx.b.load(u32x2, None, pointer, None, [])?;
+        let new = op.plain(ctx, u32x2, value, old)?;
+        ctx.b.store(pointer, new, None, [])?;
+        Ok(old)
+    })
 }
 
 /// Calls a storage compare-exchange loop on the word the instruction addresses, returning the
@@ -215,8 +223,10 @@ fn storage_atomic32x2(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> 
 fn storage_cas(ctx: &mut EmitContext<'_>, inst: InstId, func: Word, ty: Word) -> EmitResult<Word> {
     let func = defined(func)?;
     let value = ctx.def_arg(inst, 2)?;
-    let (ssbo, index) = storage_base(ctx, inst, StorageElement::U32, 4)?;
-    Ok(ctx.b.function_call(ty, None, func, [index, value, ssbo])?)
+    let (ssbo, index, in_range) = storage_base(ctx, inst, StorageElement::U32, 4)?;
+    ctx.guarded_access(in_range, Some(ty), |ctx| {
+        Ok(ctx.b.function_call(ty, None, func, [index, value, ssbo])?)
+    })
 }
 
 fn storage_cas_f16x2(ctx: &mut EmitContext<'_>, inst: InstId, func: Word) -> EmitResult<Word> {
@@ -657,13 +667,15 @@ pub(super) fn storage_atomic_compare_exchange32(
 ) -> EmitResult<Word> {
     let comparator = ctx.def_arg(inst, 2)?;
     let value = ctx.def_arg(inst, 3)?;
-    let pointer = storage_pointer(ctx, inst, StorageElement::U32, 4, 0)?;
+    let (pointer, in_range) = storage_pointer(ctx, inst, StorageElement::U32, 4, 0)?;
     let u32_t = ctx.u32[1];
     let scope = ctx.const_u32(Scope::Device as u32);
     let semantics = ctx.u32_zero_value;
-    Ok(ctx.b.atomic_compare_exchange(
-        u32_t, None, pointer, scope, semantics, semantics, value, comparator,
-    )?)
+    ctx.guarded_access(in_range, Some(u32_t), |ctx| {
+        Ok(ctx.b.atomic_compare_exchange(
+            u32_t, None, pointer, scope, semantics, semantics, value, comparator,
+        )?)
+    })
 }
 
 pub(super) fn storage_atomic_i_add64(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
@@ -719,23 +731,27 @@ pub(super) fn storage_atomic_compare_exchange64(
     let comparator = ctx.def_arg(inst, 2)?;
     let value = ctx.def_arg(inst, 3)?;
     if ctx.profile.support_int64_atomics {
-        let pointer = storage_pointer(ctx, inst, StorageElement::U64, 8, 0)?;
+        let (pointer, in_range) = storage_pointer(ctx, inst, StorageElement::U64, 8, 0)?;
         let scope = ctx.const_u32(Scope::Device as u32);
         let semantics = ctx.u32_zero_value;
-        return Ok(ctx.b.atomic_compare_exchange(
-            u64_t, None, pointer, scope, semantics, semantics, value, comparator,
-        )?);
+        return ctx.guarded_access(in_range, Some(u64_t), |ctx| {
+            Ok(ctx.b.atomic_compare_exchange(
+                u64_t, None, pointer, scope, semantics, semantics, value, comparator,
+            )?)
+        });
     }
     tracing::warn!("int64 atomics not supported, falling back to non-atomic");
     let (u1, u32x2) = (ctx.u1, ctx.u32[2]);
-    let pointer = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
-    let words = ctx.b.load(u32x2, None, pointer, None, [])?;
-    let old = ctx.b.bitcast(u64_t, None, words)?;
-    let equal = ctx.b.i_equal(u1, None, old, comparator)?;
-    let new = ctx.b.select(u64_t, None, equal, value, old)?;
-    let new_words = ctx.b.bitcast(u32x2, None, new)?;
-    ctx.b.store(pointer, new_words, None, [])?;
-    Ok(old)
+    let (pointer, in_range) = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
+    ctx.guarded_access(in_range, Some(u64_t), |ctx| {
+        let words = ctx.b.load(u32x2, None, pointer, None, [])?;
+        let old = ctx.b.bitcast(u64_t, None, words)?;
+        let equal = ctx.b.i_equal(u1, None, old, comparator)?;
+        let new = ctx.b.select(u64_t, None, equal, value, old)?;
+        let new_words = ctx.b.bitcast(u32x2, None, new)?;
+        ctx.b.store(pointer, new_words, None, [])?;
+        Ok(old)
+    })
 }
 
 pub(super) fn storage_atomic_i_add32x2(

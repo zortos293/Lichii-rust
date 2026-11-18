@@ -77,6 +77,7 @@ fn traverse(ctx: &mut EmitContext<'_>) -> EmitResult<()> {
                 for inst in program.insts_of(block) {
                     emit_inst(ctx, inst)?;
                 }
+                ctx.end_block(block);
                 in_block = true;
                 continue;
             }
@@ -150,8 +151,8 @@ fn loop_safety_condition(ctx: &mut EmitContext<'_>, cond: crate::ir::Value) -> E
     Ok(ctx.b.logical_and(ctx.u1, None, cond, safe)?)
 }
 
-/// Emits a phi with placeholder values; [`patch_phis`] fills them in once every block has
-/// been emitted, since a loop phi names values defined after it.
+/// Emits a phi with placeholder values and predecessors; [`patch_phis`] fills them in once
+/// every block has been emitted, since a loop phi names values and blocks emitted after it.
 pub(super) fn emit_phi(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     let program = ctx.program;
     let ir_inst = program.inst(inst);
@@ -174,20 +175,22 @@ pub(super) fn emit_phi(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Wo
 
 fn patch_phis(ctx: &mut EmitContext<'_>) -> EmitResult<()> {
     let phis = std::mem::take(&mut ctx.phis);
-    let mut values = SmallVec::<[Word; 4]>::new();
+    let mut values = SmallVec::<[(Word, Word); 4]>::new();
     for DeferredPhi { block, index, inst } in phis {
         values.clear();
         for i in 0..ctx.program.inst(inst).num_args() {
             let value = ctx.arg(inst, i);
-            values.push(ctx.def(value)?);
+            let predecessor = ctx.exit_label(ctx.program.inst(inst).phi_block(i));
+            values.push((ctx.def(value)?, predecessor));
         }
         let main = ctx.main_function;
         let spv_inst = &mut ctx.b.module_mut().functions[main].blocks[block].instructions[index];
         if spv_inst.class.opcode != Op::Phi {
             return Err(EmitError::InvalidIr("phi moved during emission".into()));
         }
-        for (i, &value) in values.iter().enumerate() {
+        for (i, &(value, predecessor)) in values.iter().enumerate() {
             spv_inst.operands[i * 2] = Operand::IdRef(value);
+            spv_inst.operands[i * 2 + 1] = Operand::IdRef(predecessor);
         }
     }
     Ok(())

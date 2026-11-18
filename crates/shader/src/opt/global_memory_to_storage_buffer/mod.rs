@@ -25,7 +25,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use self::conditions::Conditions;
-use self::extent::StoreExtentAnalysis;
+use self::extent::ExtentAnalysis;
 use self::native::Candidates;
 use self::track::{NVN_BIAS, Tracker, track_low_address};
 use crate::info::{StorageBufferDescriptor, StorageWriteExtent};
@@ -254,7 +254,7 @@ pub fn global_memory_to_storage_buffer(
     }
     split_address_sums(prog);
     let max_ssbos = storage_buffer_limit(profile);
-    let (storage, extents) = {
+    let (storage, extents, reads) = {
         let shared: &Program = prog;
         let mut tracker = Tracker::new(shared);
         let iterator_words = heuristics::collect_iterator_words(shared, &mut tracker);
@@ -295,8 +295,10 @@ pub fn global_memory_to_storage_buffer(
                 limit: max_ssbos,
             });
         }
-        let extents = store_extents(shared, &storage, env.workgroup_size());
-        (storage, extents)
+        let workgroup = env.workgroup_size();
+        let extents = store_extents(shared, &storage, workgroup);
+        let reads = load_extents(shared, &storage, workgroup);
+        (storage, extents, reads)
     };
     info.native_global_bounds |= storage.native_runtime_bounds;
     let set: Vec<BufferAddr> = storage.set.into_iter().collect();
@@ -314,6 +316,8 @@ pub fn global_memory_to_storage_buffer(
                 is_written,
                 indirect_offset: buffer.indirect,
                 write_extent,
+                read_extent: reads.get(buffer).copied().unwrap_or_default(),
+                reach_feedback: false,
             });
     }
     let alignment = profile.min_ssbo_alignment.clamp(1, 1 << 31) as u32;
@@ -402,19 +406,57 @@ fn store_extents(
     if storage.untracked_writes || !storage.unbounded_writes.is_empty() {
         return extents;
     }
-    let mut analyses: BTreeMap<BufferAddr, StoreExtentAnalysis> = BTreeMap::new();
+    let mut analyses: BTreeMap<BufferAddr, ExtentAnalysis> = BTreeMap::new();
     for &(buffer, inst) in &storage.to_replace {
         if !is_global_memory_write(prog.op(inst)) {
             continue;
         }
         let analysis = analyses
             .entry(buffer)
-            .or_insert_with(|| StoreExtentAnalysis::new(buffer, workgroup));
+            .or_insert_with(|| ExtentAnalysis::new(buffer, workgroup));
         let extent = extents.entry(buffer).or_insert(StorageWriteExtent {
             bounded: true,
             ..StorageWriteExtent::default()
         });
-        analysis.add_store(prog, inst, extent);
+        analysis.add_access(prog, inst, extent);
+    }
+    extents
+}
+
+/// Load extents per bound buffer, read from the guest addresses before they are rebased. None
+/// while any access stays global: the backend routes it to a bound pointer at runtime, whose
+/// binding must then reach wherever the access does.
+fn load_extents(
+    prog: &Program,
+    storage: &StorageInfo,
+    workgroup: [u32; 3],
+) -> BTreeMap<BufferAddr, StorageWriteExtent> {
+    let rebased: FxHashSet<InstId> = storage.to_replace.iter().map(|&(_, inst)| inst).collect();
+    let stays_global = prog.post_order.iter().any(|&block| {
+        prog.insts_of(block)
+            .any(|inst| is_global_memory(prog.op(inst)) && !rebased.contains(&inst))
+    });
+    if stays_global {
+        return BTreeMap::new();
+    }
+    let unread = StorageWriteExtent {
+        bounded: true,
+        ..StorageWriteExtent::default()
+    };
+    let mut extents: BTreeMap<BufferAddr, StorageWriteExtent> =
+        storage.set.iter().map(|&buffer| (buffer, unread)).collect();
+    let mut analyses: BTreeMap<BufferAddr, ExtentAnalysis> = BTreeMap::new();
+    for &(buffer, inst) in &storage.to_replace {
+        if !is_global_load(prog.op(inst)) {
+            continue;
+        }
+        let Some(extent) = extents.get_mut(&buffer) else {
+            continue;
+        };
+        analyses
+            .entry(buffer)
+            .or_insert_with(|| ExtentAnalysis::new(buffer, workgroup))
+            .add_access(prog, inst, extent);
     }
     extents
 }
@@ -465,6 +507,29 @@ fn replace(prog: &mut Program, inst: InstId, binding: Value, offset: Value) {
     prog.replace_uses_with(inst, Value::Inst(atomic));
 }
 
+/// Marks the storage buffers whose program reports its reach
+/// ([`StorageBufferDescriptor::reach_feedback`]): pointers that carry no size (any pointer of a
+/// `native` program, and pointer table entries) whose reach is not the same for every
+/// invocation. None is marked without host support, or when the feedback buffer would pass the
+/// stage's storage buffer limit.
+pub fn mark_reach_feedback(info: &mut ShaderInfo, profile: &Profile, native: bool) {
+    let descriptors = &mut info.storage_buffers_descriptors;
+    let bindings: u32 = descriptors.iter().map(|d| d.count).sum();
+    let fits = match profile.max_per_stage_storage_buffers {
+        0 => true,
+        limit => bindings < limit,
+    };
+    for desc in descriptors {
+        let sized = !native && desc.indirect_offset == StorageBufferDescriptor::DIRECT;
+        let mut extent = desc.read_extent;
+        if desc.is_written {
+            extent.merge(&desc.write_extent);
+        }
+        desc.reach_feedback =
+            profile.support_reach_feedback && fits && !sized && extent.constant_end().is_none();
+    }
+}
+
 /// The most storage buffers one stage can bind on this host.
 pub fn storage_buffer_limit(profile: &Profile) -> usize {
     match profile.max_per_stage_storage_buffers {
@@ -494,6 +559,7 @@ pub fn join_storage_info(
         });
         if let Some(index) = existing {
             let existing = &mut descriptors[index];
+            existing.read_extent.merge(&desc.read_extent);
             if desc.is_written {
                 if existing.is_written {
                     existing.write_extent.merge(&desc.write_extent);
@@ -753,13 +819,14 @@ fn global_to_storage(op: Opcode) -> Opcode {
     }
 }
 
-/// Bytes a global store or atomic writes.
-fn store_size(op: Opcode) -> u32 {
+/// Bytes a global load reads, or a store or atomic writes.
+fn access_size(op: Opcode) -> u32 {
     use Opcode::*;
     match op {
-        WriteGlobalS8 | WriteGlobalU8 => 1,
-        WriteGlobalS16 | WriteGlobalU16 => 2,
-        WriteGlobal64
+        LoadGlobalS8 | LoadGlobalU8 | WriteGlobalS8 | WriteGlobalU8 => 1,
+        LoadGlobalS16 | LoadGlobalU16 | WriteGlobalS16 | WriteGlobalU16 => 2,
+        LoadGlobal64
+        | WriteGlobal64
         | GlobalAtomicIAdd64
         | GlobalAtomicSMin64
         | GlobalAtomicUMin64
@@ -782,7 +849,7 @@ fn store_size(op: Opcode) -> u32 {
         | GlobalAtomicAddF32x2
         | GlobalAtomicMinF32x2
         | GlobalAtomicMaxF32x2 => 8,
-        WriteGlobal128 => 16,
+        LoadGlobal128 | WriteGlobal128 => 16,
         _ => 4,
     }
 }

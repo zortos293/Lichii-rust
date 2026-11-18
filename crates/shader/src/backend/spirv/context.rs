@@ -224,6 +224,9 @@ pub(crate) struct EmitContext<'a> {
 
     defs: Vec<Word>,
     labels: Vec<Word>,
+    /// Per IR block, the label of the SPIR-V block it ends in; differs from its label when a
+    /// guarded access split it.
+    exit_labels: Vec<Word>,
     pub(crate) phis: Vec<DeferredPhi>,
     pub(crate) main_function: usize,
     u32_constants: FxHashMap<u32, Word>,
@@ -281,6 +284,12 @@ pub(crate) struct EmitContext<'a> {
 
     cbufs: [[Word; 8]; ShaderInfo::MAX_CBUFS],
     ssbos: Vec<[Word; 9]>,
+    /// Per storage buffer slot, whether its accesses report their reach.
+    ssbo_feedback: Vec<bool>,
+    /// `bool(slot, offset, end, length)`: raises reach feedback word `slot` to `end` when `end`
+    /// passes `length`, the binding's bytes, and returns whether the access from `offset` to
+    /// `end` lies inside the binding. 0 when no storage buffer reports its reach.
+    pub reach_feedback_func: Word,
     pub texture_buffers: Vec<TextureBufferDefinition>,
     pub image_buffers: Vec<ImageBufferDefinition>,
     pub textures: Vec<TextureDefinition>,
@@ -530,6 +539,7 @@ impl<'a> EmitContext<'a> {
             requires_coherent_image_memory: info.requires_coherent_image_memory,
             defs: vec![0; program.num_insts()],
             labels: vec![0; program.num_blocks()],
+            exit_labels: vec![0; program.num_blocks()],
             phis: Vec::new(),
             main_function: 0,
             u32_constants: FxHashMap::default(),
@@ -580,6 +590,8 @@ impl<'a> EmitContext<'a> {
             image_u32: 0,
             cbufs: [[0; 8]; ShaderInfo::MAX_CBUFS],
             ssbos: Vec::new(),
+            ssbo_feedback: Vec::new(),
+            reach_feedback_func: 0,
             texture_buffers: Vec::new(),
             image_buffers: Vec::new(),
             textures: Vec::new(),
@@ -712,6 +724,7 @@ impl<'a> EmitContext<'a> {
         let mut image_scaling = 0;
         ctx.define_images(image_binding, &mut image_scaling)?;
         bindings.image_scaling_index += image_scaling;
+        ctx.define_reach_feedback(binding_slot(bindings, unified, BindingKind::Storage))?;
         ctx.define_attribute_mem_access()?;
         ctx.define_write_storage_cas_loop_function()?;
         ctx.define_global_memory_functions()?;
@@ -767,8 +780,35 @@ impl<'a> EmitContext<'a> {
 
     pub(crate) fn assign_labels(&mut self) {
         for &block in &self.program.block_order {
-            self.labels[block.0 as usize] = self.b.id();
+            let label = self.b.id();
+            self.labels[block.0 as usize] = label;
+            self.exit_labels[block.0 as usize] = label;
         }
+    }
+
+    /// Label of the SPIR-V block IR block `block` ends in, the predecessor its successors' phis
+    /// name.
+    pub fn exit_label(&self, block: BlockId) -> Word {
+        self.exit_labels[block.0 as usize]
+    }
+
+    /// Records the block emission is in as the end of IR block `block`, unless an instruction
+    /// already terminated it.
+    pub(crate) fn end_block(&mut self, block: BlockId) {
+        if let Some(label) = self.selected_label() {
+            self.exit_labels[block.0 as usize] = label;
+        }
+    }
+
+    fn selected_label(&self) -> Option<Word> {
+        let function = self.b.selected_function()?;
+        let block = self.b.selected_block()?;
+        self.b.module_ref().functions[function].blocks[block].label_id()
+    }
+
+    fn current_label(&self) -> EmitResult<Word> {
+        self.selected_label()
+            .ok_or_else(|| EmitError::InvalidIr("instruction outside a block".into()))
     }
 
     /// Argument `index` of `inst`, with identities followed.
@@ -1047,6 +1087,69 @@ impl<'a> EmitContext<'a> {
     /// The storage buffer view of `element` type for storage buffer descriptor slot `index`.
     pub fn ssbo(&self, index: usize, element: StorageElement) -> Word {
         self.ssbos[index][element as usize]
+    }
+
+    /// Whether the accesses of storage buffer slot `index` report their reach.
+    pub fn ssbo_reports_reach(&self, index: usize) -> bool {
+        self.ssbo_feedback[index]
+    }
+
+    /// Reports `end`, the byte an access of storage buffer slot `slot` from byte `offset` ends
+    /// at, when the slot reports its reach, and returns the condition under which the access
+    /// lies inside the binding. Such slots run without pipeline robustness, so the access must
+    /// be emitted through [`Self::guarded_access`] with that condition.
+    pub fn report_reach(
+        &mut self,
+        slot: usize,
+        offset: Word,
+        end: Word,
+    ) -> EmitResult<Option<Word>> {
+        if !self.ssbo_reports_reach(slot) {
+            return Ok(None);
+        }
+        let u32_t = self.u32[1];
+        let words = self.ssbo(slot, StorageElement::U32);
+        let words = self.b.array_length(u32_t, None, words, 0)?;
+        let two = self.const_u32(2);
+        let length = self.b.shift_left_logical(u32_t, None, words, two)?;
+        let slot = self.const_u32(slot as u32);
+        let (u1, func) = (self.u1, self.reach_feedback_func);
+        Ok(Some(self.b.function_call(
+            u1,
+            None,
+            func,
+            [slot, offset, end, length],
+        )?))
+    }
+
+    /// Emits `access` only where `in_range` holds and returns its result, of type `ty`, or zero
+    /// where it does not. Without `in_range` the access is emitted unconditionally.
+    pub fn guarded_access(
+        &mut self,
+        in_range: Option<Word>,
+        ty: Option<Word>,
+        access: impl FnOnce(&mut Self) -> EmitResult<Word>,
+    ) -> EmitResult<Word> {
+        let Some(in_range) = in_range else {
+            return access(self);
+        };
+        let skipped = self.current_label()?;
+        let access_label = self.b.id();
+        let merge_label = self.b.id();
+        self.b
+            .selection_merge(merge_label, SelectionControl::NONE)?;
+        self.b
+            .branch_conditional(in_range, access_label, merge_label, [])?;
+        self.begin_label(access_label)?;
+        let value = access(self)?;
+        let accessed = self.current_label()?;
+        self.b.branch(merge_label)?;
+        self.begin_label(merge_label)?;
+        let Some(ty) = ty else {
+            return Ok(value);
+        };
+        let zero = self.const_null(ty);
+        Ok(self.b.phi(ty, None, [(value, accessed), (zero, skipped)])?)
     }
 
     pub fn storage_type(&self, element: StorageElement) -> StorageTypeDefinition {
@@ -2248,6 +2351,11 @@ impl<'a> EmitContext<'a> {
             .map(|d| d.count)
             .sum();
         self.ssbos = vec![[0; 9]; slots as usize];
+        self.ssbo_feedback = info
+            .storage_buffers_descriptors
+            .iter()
+            .flat_map(|d| std::iter::repeat_n(d.reach_feedback, d.count as usize))
+            .collect();
         self.add_extension("SPV_KHR_storage_buffer_storage_class");
         let mut used = if profile.support_descriptor_aliasing {
             info.used_storage_buffer_types
@@ -2795,6 +2903,63 @@ impl<'a> EmitContext<'a> {
         Ok(func)
     }
 
+    /// The reach feedback buffer, after every other binding, and the function raising its words.
+    fn define_reach_feedback(&mut self, binding: &mut u32) -> EmitResult<()> {
+        if !self.info.uses_reach_feedback() {
+            return Ok(());
+        }
+        let u32_t = self.u32[1];
+        let StorageTypeDefinition {
+            array: block_pointer,
+            element: word_pointer,
+        } = self.storage_type(StorageElement::U32);
+        let words = self.global_variable(block_pointer, StorageClass::StorageBuffer, None);
+        self.decorate(words, Decoration::Binding, &[*binding]);
+        self.decorate(words, Decoration::DescriptorSet, &[0]);
+        self.b.name(words, "reach_feedback");
+        self.add_interface(words, StorageClass::StorageBuffer);
+        *binding += 1;
+
+        let u1 = self.u1;
+        let func_type = self.b.type_function(u1, [u32_t, u32_t, u32_t, u32_t]);
+        let func = self
+            .b
+            .begin_function(u1, None, FunctionControl::NONE, func_type)?;
+        let slot = self.b.function_parameter(u32_t)?;
+        let offset = self.b.function_parameter(u32_t)?;
+        let end = self.b.function_parameter(u32_t)?;
+        let length = self.b.function_parameter(u32_t)?;
+        self.b.begin_block(None)?;
+        let past = self.b.u_less_than(u1, None, length, end)?;
+        let limit = self.const_u32(1 << 31);
+        let forward = self.b.u_less_than(self.u1, None, end, limit)?;
+        let report = self.b.logical_and(self.u1, None, past, forward)?;
+        let then_label = self.b.id();
+        let merge_label = self.b.id();
+        self.b
+            .selection_merge(merge_label, SelectionControl::NONE)?;
+        self.b
+            .branch_conditional(report, then_label, merge_label, [])?;
+        self.begin_label(then_label)?;
+        let zero = self.u32_zero_value;
+        let word = self
+            .b
+            .access_chain(word_pointer, None, words, [zero, slot])?;
+        let scope_device = self.const_u32(Scope::Device as u32);
+        let relaxed = self.u32_zero_value;
+        self.b
+            .atomic_u_max(u32_t, None, word, scope_device, relaxed, end)?;
+        self.b.branch(merge_label)?;
+        self.begin_label(merge_label)?;
+        let forward = self.b.u_less_than(u1, None, offset, end)?;
+        let inside = self.b.logical_not(u1, None, past)?;
+        let in_range = self.b.logical_and(u1, None, forward, inside)?;
+        self.b.ret_value(in_range)?;
+        self.b.end_function()?;
+        self.reach_feedback_func = func;
+        Ok(())
+    }
+
     fn define_write_storage_cas_loop_function(&mut self) -> EmitResult<()> {
         let info = self.info;
         let profile = self.profile;
@@ -2911,25 +3076,37 @@ impl<'a> EmitContext<'a> {
         let low_pointer = self
             .b
             .access_chain(element, None, storage, [zero, word_index])?;
-        let low = self.b.load(u32_t, None, low_pointer, None, [])?;
         let high_pointer = self
             .b
             .access_chain(element, None, storage, [zero, next_index])?;
-        let high = self.b.load(u32_t, None, high_pointer, None, [])?;
-        let pointer_words = self.b.composite_construct(self.u32[2], None, [low, high])?;
+        let in_range = if self.ssbo_reports_reach(holder) {
+            let eight = self.const_u32(8);
+            let end = self.b.i_add(u32_t, None, byte, eight)?;
+            self.report_reach(holder, byte, end)?
+        } else {
+            None
+        };
+        let u32x2 = self.u32[2];
+        let pointer_words = self.guarded_access(in_range, Some(u32x2), |ctx| {
+            let low = ctx.b.load(u32_t, None, low_pointer, None, [])?;
+            let high = ctx.b.load(u32_t, None, high_pointer, None, [])?;
+            Ok(ctx.b.composite_construct(u32x2, None, [low, high])?)
+        })?;
         Ok(self.b.bitcast(u64_t, None, pointer_words)?)
     }
 
     /// Opens the routing body of a global memory function: for every storage buffer that may
     /// hold `addr`, a selection whose then-block calls `access` with the element pointer, the
     /// buffer view and the element index. Leaves the block after the last selection open for
-    /// the caller's fallback.
+    /// the caller's fallback. `access_bytes` is how far the access reaches from `addr`, which
+    /// a buffer that reports its reach reports.
     fn route_global(
         &mut self,
         element: StorageElement,
         addr: Word,
         element_pointer: Word,
         shift: u32,
+        access_bytes: u32,
         access: &mut dyn FnMut(&mut Self, Word, Word, Word) -> EmitResult<()>,
     ) -> EmitResult<()> {
         let info = self.info;
@@ -2945,13 +3122,33 @@ impl<'a> EmitContext<'a> {
             let ssbo = ctx.ssbo(index, element);
             let distance = ctx.b.i_sub(u64_t, None, addr, base)?;
             let offset = ctx.b.u_convert(u32_t, None, distance)?;
+            let in_range = if ctx.ssbo_reports_reach(index) {
+                let access_bytes = ctx.const_u32(access_bytes);
+                let end = ctx.b.i_add(u32_t, None, offset, access_bytes)?;
+                ctx.report_reach(index, offset, end)?
+            } else {
+                None
+            };
             let shift = ctx.const_u32(shift);
             let ssbo_index = ctx.b.shift_right_logical(u32_t, None, offset, shift)?;
             let zero = ctx.u32_zero_value;
             let pointer = ctx
                 .b
                 .access_chain(element_pointer, None, ssbo, [zero, ssbo_index])?;
+            let Some(in_range) = in_range else {
+                access(ctx, pointer, ssbo, ssbo_index)?;
+                return ctx.begin_label(else_label);
+            };
+            let access_label = ctx.b.id();
+            let past_end_label = ctx.b.id();
+            ctx.b
+                .selection_merge(past_end_label, SelectionControl::NONE)?;
+            ctx.b
+                .branch_conditional(in_range, access_label, past_end_label, [])?;
+            ctx.begin_label(access_label)?;
             access(ctx, pointer, ssbo, ssbo_index)?;
+            ctx.begin_label(past_end_label)?;
+            ctx.b.branch(else_label)?;
             ctx.begin_label(else_label)
         };
         if info.native_global_bounds {
@@ -3039,6 +3236,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 u32_element,
                 2,
+                count * 4,
                 &mut |ctx, _, ssbo, word_index| {
                     let mut words = SmallVec::<[Word; 4]>::new();
                     let u32_t = ctx.u32[1];
@@ -3063,6 +3261,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 element_pointer,
                 shift,
+                1 << shift,
                 &mut |ctx, pointer, _, _| {
                     let value = ctx.b.load(ty, None, pointer, None, [])?;
                     Ok(ctx.b.ret_value(value)?)
@@ -3111,6 +3310,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 u32_element,
                 2,
+                count * 4,
                 &mut |ctx, _, ssbo, word_index| {
                     let u32_t = ctx.u32[1];
                     let zero = ctx.u32_zero_value;
@@ -3134,6 +3334,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 element_pointer,
                 shift,
+                1 << shift,
                 &mut |ctx, pointer, _, _| {
                     ctx.b.store(pointer, data, None, [])?;
                     Ok(ctx.b.ret()?)
@@ -3160,6 +3361,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 element_pointer,
                 shift,
+                1 << shift,
                 &mut |ctx, pointer, _, _| {
                     let value = ctx.b.load(ty, None, pointer, None, [])?;
                     let wide = if signed {
@@ -3177,6 +3379,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 u32_element,
                 2,
+                1 << 2,
                 &mut |ctx, pointer, _, _| {
                     let word = ctx.b.load(u32_t, None, pointer, None, [])?;
                     let bit_offset = ctx.global_bit_offset(addr, bits)?;
@@ -3215,6 +3418,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 element_pointer,
                 bits / 16,
+                1 << (bits / 16),
                 &mut |ctx, pointer, _, _| {
                     let narrow = ctx.b.u_convert(ty, None, value)?;
                     ctx.b.store(pointer, narrow, None, [])?;
@@ -3229,6 +3433,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 u32_element,
                 2,
+                1 << 2,
                 &mut |ctx, pointer, _, _| {
                     let bit_offset = ctx.global_bit_offset(addr, bits)?;
                     let count = ctx.const_u32(bits);
@@ -3321,6 +3526,7 @@ impl<'a> EmitContext<'a> {
             addr,
             element,
             2,
+            1 << 2,
             &mut |ctx, pointer, ssbo, word| {
                 let u32_t = ctx.u32[1];
                 let zero = ctx.u32_zero_value;
@@ -3384,6 +3590,7 @@ impl<'a> EmitContext<'a> {
             address,
             element,
             2,
+            4,
             &mut |ctx, pointer, _, _| {
                 let zero = ctx.u32_zero_value;
                 let result = ctx.b.atomic_compare_exchange(

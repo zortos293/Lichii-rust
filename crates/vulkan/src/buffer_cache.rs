@@ -65,6 +65,15 @@ const LARGE_STREAM_CAP: u64 = 256 << 20;
 /// The device-local bytes cached gathers may own, evicted ones the GPU may still read included.
 /// A range larger than this gathers into stream memory on every bind instead.
 const GATHER_CACHE_BYTES: u64 = 256 << 20;
+/// The most bytes [`BufferCache::unbounded_storage_buffer`] binds behind a pointer, and the
+/// reach a program asks for when it cannot report how far it reaches.
+pub const UNBOUNDED_STORAGE_REACH: u64 = 256 << 20;
+/// The bytes [`BufferCache::unbounded_storage_buffer`] binds behind a pointer whatever the
+/// growth budget, as far as the pointer's run goes.
+pub const MIN_UNBOUNDED_REACH: u64 = 64 << 10;
+/// The bytes per scheduler tick [`BufferCache::unbounded_storage_buffer`] may bind past the end
+/// of the cached buffer holding a pointer, which the bind creates and uploads.
+const REACH_GROWTH_PER_TICK: u64 = 4 << 20;
 /// Pages [`TranslationMemo`] keeps a translation for.
 const TRANSLATION_ENTRIES: usize = 1024;
 /// No neighbour in the LRU list.
@@ -149,6 +158,8 @@ pub struct BufferCacheStats {
     pub created_buffers: u64,
     /// Buffers absorbed into a grown one.
     pub merged_buffers: u64,
+    /// Bytes by which binds of storage pointers of unknown reach created or grew cached buffers.
+    pub unbounded_reach_grown_bytes: u64,
     /// Buffers the collector evicted ([`BufferCache::evict`]), and their bytes.
     pub evicted_buffers: u64,
     pub evicted_bytes: u64,
@@ -1077,8 +1088,9 @@ struct Translation {
 /// Which GPU ranges are one contiguous device range, kept while the address space and its
 /// [`Gmmu::generation`] stay the same so binds skip the page-table walk. Direct-mapped by the
 /// 4 KiB page a range starts in. Each entry holds the run around the start of the range that
-/// last missed there, walked over the pages that range touches, so a miss costs what the walk
-/// it replaces cost and every later range inside the run hits.
+/// last missed there, walked over the pages that range touches. A miss first tries the run the
+/// last miss found, so a pointer moving through one run hits it, and a range passing the end of
+/// a run whose walk stopped early walks only the pages past that end.
 struct TranslationMemo {
     /// The address space the entries describe. Holding it keeps its allocation, so no later
     /// address space can take its place.
@@ -1087,6 +1099,8 @@ struct TranslationMemo {
     /// Entries of another epoch are stale; no entry is valid in epoch 0.
     epoch: u32,
     entries: Box<[Translation; TRANSLATION_ENTRIES]>,
+    /// The run the last miss found.
+    last: Translation,
 }
 
 impl Default for TranslationMemo {
@@ -1096,7 +1110,20 @@ impl Default for TranslationMemo {
             generation: 0,
             epoch: 0,
             entries: Box::new([Translation::default(); TRANSLATION_ENTRIES]),
+            last: Translation::default(),
         }
+    }
+}
+
+impl Translation {
+    /// Whether the entry answers a range from `gpu_va` to `end` without walking.
+    fn covers(&self, epoch: u32, gpu_va: GpuVAddr, end: GpuVAddr) -> bool {
+        self.epoch == epoch && (self.start..self.end).contains(&gpu_va) && !self.stops_before(end)
+    }
+
+    /// Whether the walk that found this device run stopped before `end`.
+    fn stops_before(&self, end: GpuVAddr) -> bool {
+        end > self.end && self.daddr != NOT_DEVICE && !self.closed
     }
 }
 
@@ -1104,6 +1131,15 @@ impl TranslationMemo {
     /// The device address `[gpu_va, +size)` maps to when it is one contiguous device range.
     #[inline]
     fn contiguous(&mut self, gmmu: &Arc<Gmmu>, gpu_va: GpuVAddr, size: u64) -> Option<DAddr> {
+        self.run(gmmu, gpu_va, size)
+            .filter(|&(_, run)| run == size)
+            .map(|(daddr, _)| daddr)
+    }
+
+    /// The device address `gpu_va` maps to, and the bytes of `[gpu_va, +size)` that stay one
+    /// contiguous device range from it.
+    #[inline]
+    fn run(&mut self, gmmu: &Arc<Gmmu>, gpu_va: GpuVAddr, size: u64) -> Option<(DAddr, u64)> {
         let end = gpu_va
             .checked_add(size)
             .filter(|&end| size != 0 && end <= GPU_VA_SIZE)?;
@@ -1120,15 +1156,25 @@ impl TranslationMemo {
         let slot = ((gpu_va >> PAGE_BITS).wrapping_mul(0x9e37_79b9_7f4a_7c15)
             >> (64 - TRANSLATION_ENTRIES.trailing_zeros())) as usize;
         let mut entry = self.entries[slot];
-        if entry.epoch != self.epoch
-            || !(entry.start..entry.end).contains(&gpu_va)
-            || (end > entry.end && entry.daddr != NOT_DEVICE && !entry.closed)
-        {
-            entry = Self::walk(gmmu, gpu_va, end, self.epoch);
+        if !entry.covers(self.epoch, gpu_va, end) {
+            let last = self.last;
+            entry = if last.epoch == self.epoch && (last.start..last.end).contains(&gpu_va) {
+                last
+            } else {
+                Self::walk(gmmu, gpu_va, end, self.epoch)
+            };
+            if entry.stops_before(end) {
+                Self::extend(gmmu, &mut entry, end);
+            }
             self.entries[slot] = entry;
+            self.last = entry;
         }
-        (entry.daddr != NOT_DEVICE && end <= entry.end)
-            .then(|| entry.daddr + (gpu_va - entry.start))
+        (entry.daddr != NOT_DEVICE).then(|| {
+            (
+                entry.daddr + (gpu_va - entry.start),
+                entry.end.min(end) - gpu_va,
+            )
+        })
     }
 
     /// The run holding `gpu_va` within the pages `[gpu_va, end)` touches.
@@ -1154,6 +1200,24 @@ impl TranslationMemo {
             }
         });
         found
+    }
+
+    /// Walks the pages from the end of `run` to `end`, extending the run over those that
+    /// continue it.
+    #[cold]
+    #[inline(never)]
+    fn extend(gmmu: &Gmmu, run: &mut Translation, end: GpuVAddr) {
+        let from = run.end;
+        let stop = end.next_multiple_of(PAGE_SIZE);
+        let next = run.daddr + (from - run.start);
+        let mut first = true;
+        run.closed = true;
+        gmmu.for_each_range(from, stop - from, |range| {
+            if std::mem::take(&mut first) && range.target == RangeTarget::Device(next) {
+                run.end = range.gpu_va + range.size;
+                run.closed = run.end < stop;
+            }
+        });
     }
 }
 
@@ -1312,6 +1376,10 @@ pub struct BufferCache {
     gather_retired: VecDeque<(u64, Buffer)>,
     gather_retired_bytes: u64,
     translations: TranslationMemo,
+    /// Bytes by which [`BufferCache::create`] grew the cached buffers, absorbed ones aside.
+    grown_bytes: u64,
+    /// The tick [`REACH_GROWTH_PER_TICK`] was last refilled in, and the bytes left of it.
+    reach_growth: (u64, u64),
     /// The collector frame acquires stamp on buffers.
     frame: u64,
     lru_head: u32,
@@ -1374,6 +1442,8 @@ impl BufferCache {
             gather_retired: VecDeque::new(),
             gather_retired_bytes: 0,
             translations: TranslationMemo::default(),
+            grown_bytes: 0,
+            reach_growth: (0, 0),
             frame: 0,
             lru_head: NIL,
             lru_tail: NIL,
@@ -2260,8 +2330,9 @@ impl BufferCache {
             }
         }
         let size = end - begin;
+        let absorbed: u64 = self.overlaps.iter().map(|&id| self.buffer(id).size).sum();
+        self.grown_bytes += size - absorbed;
         if self.cached_bytes + size > self.create_limit {
-            let absorbed: u64 = self.overlaps.iter().map(|&id| self.buffer(id).size).sum();
             let after = self.cached_bytes - absorbed + size;
             if after > self.create_limit {
                 self.evict_before_create(
@@ -2935,6 +3006,60 @@ impl BufferCache {
         Ok(Some(binding))
     }
 
+    /// A storage binding at `gpu_va` for a program whose reach past it is not known up front. It
+    /// binds in place over the pointer's contiguous device run, `reach` bytes from the aligned
+    /// pointer at most. Past [`MIN_UNBOUNDED_REACH`] and the end of the cached buffer already
+    /// holding the pointer, a bind takes at most what is left of [`REACH_GROWTH_PER_TICK`] this
+    /// tick, so no bind uploads more than that; later binds reach further. The bytes a bind
+    /// creates or grows count in [`BufferCacheStats::unbounded_reach_grown_bytes`]. `None` when
+    /// no device memory backs the pointer.
+    pub fn unbounded_storage_buffer(
+        &mut self,
+        scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
+        gmmu: &Arc<Gmmu>,
+        gpu_va: GpuVAddr,
+        reach: u64,
+        written: bool,
+    ) -> Result<Option<BufferBinding>> {
+        if gpu_va == 0 {
+            return Ok(None);
+        }
+        let align = self.storage_alignment();
+        let start = gpu_va & !(align - 1);
+        let Some((daddr, run)) = self.translations.run(gmmu, start, reach) else {
+            return Ok(None);
+        };
+        let resident = Self::lookup(&self.page_table, daddr).map_or(0, |id| {
+            let buffer = self.buffer(id);
+            buffer.daddr + buffer.size - daddr
+        });
+        let free = resident.max(MIN_UNBOUNDED_REACH);
+        let size = if run <= free {
+            run
+        } else {
+            let tick = scheduler.tick();
+            if self.reach_growth.0 != tick {
+                self.reach_growth = (tick, REACH_GROWTH_PER_TICK);
+            }
+            let grow = (run - free).min(self.reach_growth.1);
+            self.reach_growth.1 -= grow;
+            free + grow
+        };
+        let grown = self.grown_bytes;
+        let binding = self.acquire(scheduler, staging, daddr, size)?;
+        self.stats.unbounded_reach_grown_bytes += self.grown_bytes - grown;
+        if binding.offset % align != 0 {
+            let size = size.saturating_sub(gpu_va - start);
+            return self.storage_buffer(scheduler, staging, gmmu, gpu_va, size, written);
+        }
+        if written {
+            self.prepare_gpu_write(scheduler, staging, daddr, size)?;
+            self.bind_gpu_write(daddr, size);
+        }
+        Ok(Some(binding))
+    }
+
     /// A texel buffer view of `[gpu_va, +size)` read as `format`, `texel` bytes an element, over
     /// the range's first contiguous run as Lichii binds texture buffers. Views are created on
     /// first use and dropped with their buffer. With `written`, the viewed range is marked
@@ -3533,6 +3658,20 @@ mod tests {
                     &self.gmmu,
                     gpu_va,
                     size,
+                    false,
+                )
+                .unwrap()
+                .unwrap()
+        }
+
+        fn unbounded_read(&mut self, gpu_va: GpuVAddr, reach: u64) -> BufferBinding {
+            self.cache
+                .unbounded_storage_buffer(
+                    &mut self.scheduler,
+                    &mut self.staging,
+                    &self.gmmu,
+                    gpu_va,
+                    reach.min(UNBOUNDED_STORAGE_REACH),
                     false,
                 )
                 .unwrap()
@@ -4665,6 +4804,157 @@ mod tests {
             f.read_binding(binding) == expected,
             "the unmapped chunk, now mapped, reads its device bytes"
         );
+        f.assert_no_validation_errors();
+    }
+
+    /// A storage pointer of unknown reach binds in place over its contiguous device run (a pool
+    /// read megabytes past its pointer, as Ocarina of Time's grass is), cut where the run, the
+    /// reach asked for or the tick's growth budget ends, whatever cached buffer held it before.
+    /// Each tick grows the cached buffer by the budget at most, counted; once it holds the run,
+    /// binds copy and count nothing.
+    #[test]
+    fn unbounded_storage_reads_bind_the_device_run_in_place() {
+        const MIB: u64 = 1 << 20;
+        let Some(mut f) = fixture() else { return };
+        f.gmmu.map(GPU_VA, DADDR, 12 * MIB, 0, false).unwrap();
+        let pool = GPU_VA + 3 * MIB;
+        f.storage_read(pool, CACHING_PAGE_SIZE);
+        let grown = f.cache.stats().unbounded_reach_grown_bytes;
+        let free = CACHING_PAGE_SIZE.max(MIN_UNBOUNDED_REACH);
+        assert_eq!(
+            f.unbounded_read(pool, u64::MAX).size,
+            free + REACH_GROWTH_PER_TICK,
+            "past the cached buffer, one tick's growth"
+        );
+        assert_eq!(
+            f.unbounded_read(pool, u64::MAX).size,
+            free + REACH_GROWTH_PER_TICK,
+            "the tick's budget is spent"
+        );
+        f.scheduler.flush().unwrap();
+        assert_eq!(
+            f.unbounded_read(pool, u64::MAX).size,
+            free + 2 * REACH_GROWTH_PER_TICK,
+            "the next tick grows it again"
+        );
+        f.scheduler.flush().unwrap();
+        let first = f.unbounded_read(pool, u64::MAX);
+        assert_eq!(first.size, 9 * MIB, "to the end of the device run");
+        assert_eq!(
+            f.cache.stats().unbounded_reach_grown_bytes - grown,
+            9 * MIB - CACHING_PAGE_SIZE,
+            "the small cached buffer grew to the run"
+        );
+        let stats = f.cache.stats();
+        assert_eq!(f.unbounded_read(pool, u64::MAX), first);
+        assert_eq!(
+            f.unbounded_read(pool, 2 * MIB).size,
+            2 * MIB,
+            "the host limit"
+        );
+        assert_eq!(
+            f.cache.stats(),
+            stats,
+            "binding it again copies or grows nothing"
+        );
+
+        let split = GPU_VA + 32 * MIB;
+        f.gmmu.map(split, DADDR + 12 * MIB, MIB, 0, false).unwrap();
+        f.gmmu.map(split + MIB, DADDR, MIB, 0, false).unwrap();
+        assert_eq!(
+            f.unbounded_read(split, u64::MAX).size,
+            MIB,
+            "the binding stops where the device run does"
+        );
+        assert_eq!(
+            (
+                f.cache.stats().streamed_bytes,
+                f.cache.stats().gathered_bytes
+            ),
+            (stats.streamed_bytes, stats.gathered_bytes),
+            "no bind gathered"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    /// However far a pointer of unknown reach asks to reach over memory no cached buffer holds,
+    /// one tick's binds upload at most [`MIN_UNBOUNDED_REACH`] each plus
+    /// [`REACH_GROWTH_PER_TICK`] between them.
+    #[test]
+    fn unbounded_binds_upload_no_more_than_the_growth_cap() {
+        const MIB: u64 = 1 << 20;
+        let Some(mut f) = fixture() else { return };
+        f.gmmu.map(GPU_VA, DADDR, 64 * MIB, 0, false).unwrap();
+        let uploaded = f.cache.stats().uploaded_bytes;
+        let pools = 4;
+        for i in 0..pools {
+            let binding = f.unbounded_read(GPU_VA + i * 16 * MIB, UNBOUNDED_STORAGE_REACH);
+            assert!(binding.size <= MIN_UNBOUNDED_REACH + REACH_GROWTH_PER_TICK);
+        }
+        assert!(
+            f.cache.stats().uploaded_bytes - uploaded
+                <= pools * MIN_UNBOUNDED_REACH + REACH_GROWTH_PER_TICK,
+            "uploaded {} bytes in one tick",
+            f.cache.stats().uploaded_bytes - uploaded
+        );
+        f.assert_no_validation_errors();
+    }
+
+    /// Per-bind cost of a storage pointer of unknown reach once its binding grew to the reach its
+    /// program reported, beside an exact bind of the bytes it reads and the 256 MiB reach of a
+    /// program that cannot report it. The pointer moves 0x100 bytes a bind through a 256 MiB pool
+    /// of 64 KiB pages; the written rounds dirty one page under the pointer before each bind:
+    /// `cargo test --release -p lichii-vulkan --lib unknown_reach_bind_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn unknown_reach_bind_cost() {
+        use std::time::Instant;
+        const MIB: u64 = 1 << 20;
+        const POOL: u64 = 256 * MIB;
+        const BINDS: u64 = 20_000;
+        let Some(mut f) = fixture_with(POOL + MIB) else {
+            return;
+        };
+        f.gmmu.map(GPU_VA, DADDR, POOL, 0, true).unwrap();
+        while f.unbounded_read(GPU_VA, POOL).size < POOL {
+            f.scheduler.flush().unwrap();
+        }
+        f.scheduler.finish().unwrap();
+        let pointer = |i: u64| GPU_VA + (i * 0x100) % (POOL / 2);
+        let mut measure = |name: &str, written: bool, bind: &mut dyn FnMut(&mut Fixture, u64)| {
+            let start = Instant::now();
+            for i in 0..BINDS {
+                if written {
+                    f.cache.cpu_written(DADDR + (pointer(i) - GPU_VA), 4);
+                }
+                bind(&mut f, pointer(i));
+            }
+            let elapsed = start.elapsed();
+            f.scheduler.finish().unwrap();
+            eprintln!(
+                "{name:>40}: {:>8.0} ns a bind",
+                elapsed.as_secs_f64() * 1e9 / BINDS as f64
+            );
+        };
+        for written in [false, true] {
+            let label = if written { ", written" } else { "" };
+            measure(&format!("exact 0x100{label}"), written, &mut |f, va| {
+                f.storage_read(va, 0x100);
+            });
+            for reach in [MIN_UNBOUNDED_REACH, MIB] {
+                let name = format!("unknown, grown to {} KiB{label}", reach >> 10);
+                measure(&name, written, &mut |f, va| {
+                    f.unbounded_read(va, reach);
+                });
+            }
+            measure(
+                &format!("unknown, no feedback{label}"),
+                written,
+                &mut |f, va| {
+                    f.unbounded_read(va, UNBOUNDED_STORAGE_REACH);
+                },
+            );
+        }
         f.assert_no_validation_errors();
     }
 

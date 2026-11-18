@@ -98,6 +98,16 @@ pub struct StorageBufferDescriptor {
     pub indirect_offset: u32,
     /// How far the program's stores reach past the pointer; unbounded when unknown or unwritten.
     pub write_extent: StorageWriteExtent,
+    /// How far the program's loads reach past the pointer; bounded at 0 when it loads nothing,
+    /// unbounded when unknown.
+    pub read_extent: StorageWriteExtent,
+    /// The pointer carries no size and the program's reach past it is not the same for every
+    /// invocation, so the program reports it: each access past the end of the binding raises
+    /// this buffer's word of the module's [`DescriptorKind::ReachFeedback`] buffer to the end
+    /// of the access, in bytes from the binding's start.
+    ///
+    /// [`DescriptorKind::ReachFeedback`]: crate::DescriptorKind::ReachFeedback
+    pub reach_feedback: bool,
 }
 
 impl StorageBufferDescriptor {
@@ -105,8 +115,8 @@ impl StorageBufferDescriptor {
     pub const DIRECT: u32 = u32::MAX;
 }
 
-/// How far a program's stores and atomics to one storage buffer can reach, in bytes past the
-/// pointer it reads from its constant buffer. Every store ends at or below
+/// How far a program's stores and atomics (or, as a read extent, its loads) to one storage buffer
+/// can reach, in bytes past the pointer it reads from its constant buffer. Every store ends at or below
 /// `const_end + sum(local_stride[i] * local_id[i]) + sum(group_stride[i] * group_id[i])` for every
 /// invocation. The bound only holds while each value the store offsets split into 16-bit halves
 /// stays below 2^16: `guard_*` bounds the largest of them in the same form.
@@ -140,6 +150,47 @@ pub struct StorageWriteExtent {
 }
 
 impl StorageWriteExtent {
+    /// The reach when it is the same for every invocation: bounded, with no invocation or
+    /// workgroup terms in the bound or its guard.
+    pub fn constant_end(&self) -> Option<u32> {
+        let varies = |strides: &[u32; 3]| strides.iter().any(|&s| s != 0);
+        let guard_varies =
+            self.guarded && (varies(&self.guard_local_stride) || varies(&self.guard_group_stride));
+        let fixed = self.bounded
+            && !varies(&self.local_stride)
+            && !varies(&self.group_stride)
+            && !guard_varies;
+        fixed.then_some(self.const_end)
+    }
+
+    /// The reach of a dispatch of `groups` workgroups of `workgroup` invocations each: the bound
+    /// at the largest ids. `None` when unbounded, or when the guard can reach 2^16 in it.
+    pub fn dispatch_end(&self, workgroup: [u32; 3], groups: [u32; 3]) -> Option<u64> {
+        if !self.bounded {
+            return None;
+        }
+        let at_largest_ids = |c: u32, local: &[u32; 3], group: &[u32; 3]| {
+            (0..3).fold(u64::from(c), |sum, i| {
+                let local = u64::from(local[i]) * u64::from(workgroup[i].saturating_sub(1));
+                let group = u64::from(group[i]) * u64::from(groups[i].saturating_sub(1));
+                sum.saturating_add(local).saturating_add(group)
+            })
+        };
+        let guard = at_largest_ids(
+            self.guard_const,
+            &self.guard_local_stride,
+            &self.guard_group_stride,
+        );
+        if self.guarded && guard > 0xffff {
+            return None;
+        }
+        Some(at_largest_ids(
+            self.const_end,
+            &self.local_stride,
+            &self.group_stride,
+        ))
+    }
+
     /// Widens this extent to also cover `other`; either one unbounded leaves it unbounded.
     pub fn merge(&mut self, other: &StorageWriteExtent) {
         if !self.bounded || !other.bounded {
@@ -422,6 +473,14 @@ impl ShaderInfo {
     pub const MAX_CBUFS: usize = 18;
     pub const MAX_INDIRECT_CBUFS: usize = 14;
     pub const MAX_SSBOS: usize = 64;
+
+    /// Whether any storage buffer reports its reach, so the module declares a
+    /// [`DescriptorKind::ReachFeedback`](crate::DescriptorKind::ReachFeedback) binding.
+    pub fn uses_reach_feedback(&self) -> bool {
+        self.storage_buffers_descriptors
+            .iter()
+            .any(|d| d.reach_feedback)
+    }
 
     /// The program observes the 32-lane guest warp: votes, ballots, shuffles, lane ids, or a
     /// divergent barrier whose removal relies on the warp running in step.

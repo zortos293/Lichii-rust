@@ -25,6 +25,8 @@ fn storage_descriptor(cbuf_offset: u32) -> StorageBufferDescriptor {
         is_written: true,
         indirect_offset: StorageBufferDescriptor::DIRECT,
         write_extent: Default::default(),
+        read_extent: Default::default(),
+        reach_feedback: false,
     }
 }
 
@@ -76,6 +78,172 @@ fn storage_memory_program() -> TranslatedProgram {
         ..ShaderInfo::default()
     };
     finish_compute(s, b, info)
+}
+
+fn emit_words(profile: &Profile, program: &TranslatedProgram) -> Vec<u32> {
+    emit_spirv(
+        profile,
+        &RuntimeInfo::default(),
+        program,
+        &mut Bindings::default(),
+    )
+    .expect("emit")
+}
+
+/// A storage buffer that reports its reach declares the feedback buffer after every other
+/// binding and passes each access's end to the one function raising its word. A module with no
+/// such buffer emits the same words whether the host supports reach feedback or not.
+#[test]
+fn storage_reach_feedback_reports_every_access_of_marked_buffers() {
+    let program = storage_memory_program();
+    let feedback_host = Profile {
+        support_reach_feedback: true,
+        ..Profile::default()
+    };
+    assert_eq!(
+        emit_words(&feedback_host, &program),
+        emit_words(&Profile::default(), &program),
+        "unmarked buffers emit what they did before"
+    );
+    let plain = emit(
+        "storage_plain",
+        &feedback_host,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(count_ops(&plain, Op::AtomicUMax), 0);
+
+    let mut marked = program;
+    marked.info.storage_buffers_descriptors[0].reach_feedback = true;
+    let module = emit(
+        "storage_feedback",
+        &feedback_host,
+        &RuntimeInfo::default(),
+        &marked,
+    );
+    assert_eq!(
+        count_ops(&module, Op::AtomicUMax),
+        1,
+        "one raising function"
+    );
+    assert_eq!(
+        count_ops(&module, Op::ArrayLength),
+        count_entry_ops(&module, Op::ArrayLength)
+    );
+    assert!(
+        count_entry_ops(&module, Op::FunctionCall) > count_entry_ops(&plain, Op::FunctionCall),
+        "accesses report their end"
+    );
+    let accesses = count_entry_ops(&module, Op::ArrayLength);
+    assert!(accesses >= 42, "every load and store reports: {accesses}");
+    assert_eq!(
+        count_entry_ops(&module, Op::SelectionMerge) - count_entry_ops(&plain, Op::SelectionMerge),
+        accesses,
+        "every access is guarded by its own range check"
+    );
+    let named = module.debug_names.iter().any(|i| {
+        matches!(i.operands.get(1), Some(Operand::LiteralString(name)) if name == "reach_feedback")
+    });
+    assert!(named, "the feedback buffer is declared");
+}
+
+/// Guarded accesses split the blocks they sit in. The phis after them, at a selection merge
+/// and on a loop back edge, still name the block each predecessor ends in, so the module
+/// validates.
+#[test]
+fn guarded_accesses_keep_phis_naming_their_predecessors() {
+    let mut s = Synthetic::new();
+    let (entry, x) = compute_block(&mut s);
+    let then = s.block();
+    let merge = s.block();
+    let header = s.block();
+    let body = s.block();
+    let continue_block = s.block();
+    let exit = s.block();
+    let binding = Value::U32(0);
+    let first = s.inst(entry, Opcode::LoadStorage32, &[binding, x]);
+    let nonzero = s.inst(entry, Opcode::INotEqual, &[first, Value::U32(0)]);
+    let taken = s.inst(entry, Opcode::ConditionRef, &[nonzero]);
+    let second = s.inst(then, Opcode::LoadStorage32, &[binding, Value::U32(16)]);
+    let picked = s.phi(merge, Type::U32);
+    s.ir.add_phi_operand(picked, entry, first);
+    s.ir.add_phi_operand(picked, then, second);
+    let sum = s.phi(header, Type::U32);
+    let loaded = s.inst(
+        continue_block,
+        Opcode::LoadStorage32,
+        &[binding, Value::Inst(sum)],
+    );
+    let next = s.inst(continue_block, Opcode::IAdd32, &[Value::Inst(sum), loaded]);
+    let below = s.inst(continue_block, Opcode::ULessThan, &[next, Value::U32(64)]);
+    let again = s.inst(continue_block, Opcode::ConditionRef, &[below]);
+    s.ir.add_phi_operand(sum, merge, Value::Inst(picked));
+    s.ir.add_phi_operand(sum, continue_block, next);
+    s.inst(
+        exit,
+        Opcode::WriteStorage32,
+        &[binding, Value::U32(0), Value::Inst(sum)],
+    );
+    s.ir.add_branch(entry, then);
+    s.ir.add_branch(entry, merge);
+    s.ir.add_branch(then, merge);
+    s.ir.add_branch(merge, header);
+    s.ir.add_branch(header, body);
+    s.ir.add_branch(body, continue_block);
+    s.ir.add_branch(continue_block, header);
+    s.ir.add_branch(continue_block, exit);
+    let syntax = vec![
+        SyntaxNode::Block(entry),
+        SyntaxNode::If {
+            cond: taken,
+            body: then,
+            merge,
+        },
+        SyntaxNode::Block(then),
+        SyntaxNode::EndIf { merge },
+        SyntaxNode::Block(merge),
+        SyntaxNode::Block(header),
+        SyntaxNode::Loop {
+            body,
+            continue_block,
+            merge: exit,
+        },
+        SyntaxNode::Block(body),
+        SyntaxNode::Block(continue_block),
+        SyntaxNode::Repeat {
+            cond: again,
+            loop_header: header,
+            merge: exit,
+        },
+        SyntaxNode::Block(exit),
+        SyntaxNode::Return,
+    ];
+    let info = ShaderInfo {
+        uses_local_invocation_id: true,
+        used_storage_buffer_types: Type::U32,
+        storage_buffers_descriptors: vec![StorageBufferDescriptor {
+            reach_feedback: true,
+            ..storage_descriptor(0x110)
+        }],
+        ..ShaderInfo::default()
+    };
+    let program = s.finish(syntax, ShaderStage::Compute, info);
+    let feedback_host = Profile {
+        support_reach_feedback: true,
+        ..Profile::default()
+    };
+    let module = emit(
+        "guarded_phis",
+        &feedback_host,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(
+        count_entry_ops(&module, Op::Phi),
+        2 + 3,
+        "two IR phis and one per guarded load"
+    );
+    assert_eq!(count_entry_ops(&module, Op::SelectionMerge), 1 + 4);
 }
 
 #[test]
@@ -218,6 +386,88 @@ fn global_loads_stores_and_atomics_call_the_routing_functions() {
             "{op:?}: {error}"
         );
     }
+}
+
+/// A native program's global accesses, routed to the nearest storage buffer below them, report
+/// their end when that buffer reports its reach.
+#[test]
+fn routed_global_accesses_report_the_reach_of_marked_buffers() {
+    let mut s = Synthetic::new();
+    let (b, _) = compute_block(&mut s);
+    let address = Value::U64(0x8000_1000);
+    for (load, write) in [
+        (Opcode::LoadGlobal32, Opcode::WriteGlobal32),
+        (Opcode::LoadGlobal64, Opcode::WriteGlobal64),
+    ] {
+        let value = s.inst(b, load, &[address]);
+        s.inst(b, write, &[address, value]);
+    }
+    let info = ShaderInfo {
+        native_global_bounds: true,
+        ..global_memory_info(0x110)
+    };
+    let profile = Profile {
+        support_int64: true,
+        support_reach_feedback: true,
+        min_ssbo_alignment: 4,
+        ..Profile::default()
+    };
+    let plain = emit(
+        "routed_plain",
+        &profile,
+        &RuntimeInfo::default(),
+        &finish_compute(Synthetic { ir: s.ir.clone() }, b, info.clone()),
+    );
+    let mut marked = info;
+    marked.storage_buffers_descriptors[0].reach_feedback = true;
+    let module = emit(
+        "routed_feedback",
+        &profile,
+        &RuntimeInfo::default(),
+        &finish_compute(s, b, marked),
+    );
+    assert_eq!(count_ops(&plain, Op::AtomicUMax), 0);
+    assert_eq!(count_ops(&module, Op::AtomicUMax), 1);
+    assert_eq!(
+        count_ops(&module, Op::ArrayLength),
+        count_ops(&module, Op::FunctionCall) - count_ops(&plain, Op::FunctionCall),
+        "every report measures its binding"
+    );
+    assert!(
+        count_ops(&module, Op::FunctionCall) > count_ops(&plain, Op::FunctionCall),
+        "the routing functions report"
+    );
+    assert_eq!(
+        count_ops(&module, Op::SelectionMerge) - count_ops(&plain, Op::SelectionMerge),
+        count_ops(&module, Op::ArrayLength) + 1,
+        "every routed access is guarded by its range check, plus the raising function's report"
+    );
+    let adds_of = |module: &dr::Module, bytes: u32| {
+        let constant = module.types_global_values.iter().find_map(|i| {
+            (i.class.opcode == Op::Constant
+                && i.operands == [Operand::LiteralBit32(bytes)]
+                && module.types_global_values.iter().any(|t| {
+                    t.result_id == i.result_type
+                        && t.operands == [Operand::LiteralBit32(32), Operand::LiteralBit32(0)]
+                }))
+            .then_some(i.result_id)
+            .flatten()
+        });
+        module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                i.class.opcode == Op::IAdd
+                    && constant.is_some_and(|c| i.operands.contains(&Operand::IdRef(c)))
+            })
+            .count()
+    };
+    assert!(
+        adds_of(&module, 8) > adds_of(&plain, 8),
+        "a 64-bit routed access reports its whole width"
+    );
 }
 
 #[test]

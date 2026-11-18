@@ -67,6 +67,7 @@ pub(crate) fn shader_profile(
         },
         unified_descriptor_binding: true,
         support_descriptor_aliasing: true,
+        support_reach_feedback: true,
         support_int8: features.shader_int8,
         support_int16: features.shader_int16,
         support_int64: features.shader_int64,

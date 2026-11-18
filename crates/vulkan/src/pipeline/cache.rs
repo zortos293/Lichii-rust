@@ -328,6 +328,12 @@ pub struct PipelineStats {
     pub libraries: u64,
     /// Pipelines linked from libraries for draws whose pipeline was still building.
     pub fast_linked: u64,
+    /// Complete pipelines the driver compiled rather than found in its cache.
+    pub full_compiles: u64,
+    /// Worker time spent building the [`Self::full_compiles`].
+    pub compile_time: Duration,
+    /// Worker time spent building the [`Self::libraries`].
+    pub library_time: Duration,
 }
 
 /// `None` once set: the build failed and the draw is skipped from then on instead of being
@@ -342,6 +348,8 @@ struct Shared {
     built: AtomicU64,
     /// Builds the driver compiled rather than found in its cache.
     compiled: AtomicU64,
+    compile_nanos: AtomicU64,
+    library_nanos: AtomicU64,
     failed: AtomicU64,
     cache_hits: AtomicU64,
     libraries: AtomicU64,
@@ -435,6 +443,7 @@ enum Build {
 impl Context {
     fn build(&self, build: Build) -> Option<Pipeline> {
         let library = matches!(&build, Build::Graphics { part, .. } if part.is_library());
+        let start = Instant::now();
         let (result, layout) = match build {
             Build::Graphics {
                 key,
@@ -467,9 +476,13 @@ impl Context {
                 (result, layout)
             }
         };
+        let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         match result {
             Ok((raw, _)) if library => {
                 self.shared.libraries.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .library_nanos
+                    .fetch_add(nanos, Ordering::Relaxed);
                 Some(Pipeline::new(raw, layout))
             }
             Ok((raw, cache_hit)) => {
@@ -478,6 +491,9 @@ impl Context {
                     self.shared.cache_hits.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.shared.compiled.fetch_add(1, Ordering::Relaxed);
+                    self.shared
+                        .compile_nanos
+                        .fetch_add(nanos, Ordering::Relaxed);
                 }
                 Some(Pipeline::new(raw, layout))
             }
@@ -1171,6 +1187,8 @@ impl PipelineCache {
                     shutdown: AtomicBool::new(false),
                     built: AtomicU64::new(0),
                     compiled: AtomicU64::new(0),
+                    compile_nanos: AtomicU64::new(0),
+                    library_nanos: AtomicU64::new(0),
                     failed: AtomicU64::new(0),
                     cache_hits: AtomicU64::new(0),
                     libraries: AtomicU64::new(0),
@@ -1598,6 +1616,9 @@ impl PipelineCache {
             loaded_bytes: self.loaded_blob_bytes,
             libraries: shared.libraries.load(Ordering::Relaxed),
             fast_linked: shared.fast_linked.load(Ordering::Relaxed),
+            full_compiles: shared.compiled.load(Ordering::Relaxed),
+            compile_time: Duration::from_nanos(shared.compile_nanos.load(Ordering::Relaxed)),
+            library_time: Duration::from_nanos(shared.library_nanos.load(Ordering::Relaxed)),
         }
     }
 
@@ -2806,6 +2827,10 @@ mod tests {
         assert_eq!(cache.replaced().count(), 1);
         assert_eq!(cache.stats().built, 2);
         let stats = cache.stats();
+        assert_eq!(stats.full_compiles, stats.built - stats.cache_hits);
+        assert!(stats.full_compiles > 0, "a cold cache compiles: {stats:?}");
+        assert!(stats.compile_time > Duration::ZERO, "{stats:?}");
+        assert!(stats.library_time > Duration::ZERO, "{stats:?}");
         assert_eq!(
             device.pipelines(),
             stats.built + stats.libraries,

@@ -111,6 +111,8 @@ mod tests {
             is_written: true,
             indirect_offset: StorageBufferDescriptor::DIRECT,
             write_extent: Default::default(),
+            read_extent: Default::default(),
+            reach_feedback: false,
         };
         let info = ShaderInfo {
             storage_buffers_descriptors: vec![direct],
