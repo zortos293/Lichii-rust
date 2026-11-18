@@ -223,6 +223,7 @@ impl VulkanRasterizer {
             },
             samplers: regs.tex_sampler.address(),
             sampler_limit: regs.tex_sampler.limit,
+            dispatch: None,
         };
         let header = src.pool.header(ctx.memory, draw.texture);
         if matches!(header.format.numeric(), Numeric::Uint | Numeric::Sint) {

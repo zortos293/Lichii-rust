@@ -156,6 +156,34 @@ impl StorageWriteExtent {
         fixed.then_some(self.const_end)
     }
 
+    /// The reach of a dispatch of `groups` workgroups of `workgroup` invocations each: the bound
+    /// at the largest ids. `None` when unbounded, or when the guard can reach 2^16 in it.
+    pub fn dispatch_end(&self, workgroup: [u32; 3], groups: [u32; 3]) -> Option<u64> {
+        if !self.bounded {
+            return None;
+        }
+        let at_largest_ids = |c: u32, local: &[u32; 3], group: &[u32; 3]| {
+            (0..3).fold(u64::from(c), |sum, i| {
+                let local = u64::from(local[i]) * u64::from(workgroup[i].saturating_sub(1));
+                let group = u64::from(group[i]) * u64::from(groups[i].saturating_sub(1));
+                sum.saturating_add(local).saturating_add(group)
+            })
+        };
+        let guard = at_largest_ids(
+            self.guard_const,
+            &self.guard_local_stride,
+            &self.guard_group_stride,
+        );
+        if self.guarded && guard > 0xffff {
+            return None;
+        }
+        Some(at_largest_ids(
+            self.const_end,
+            &self.local_stride,
+            &self.group_stride,
+        ))
+    }
+
     /// Widens this extent to also cover `other`; either one unbounded leaves it unbounded.
     pub fn merge(&mut self, other: &StorageWriteExtent) {
         if !self.bounded || !other.bounded {

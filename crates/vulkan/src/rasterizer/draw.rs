@@ -869,6 +869,10 @@ struct StageSources<'a> {
     pool: TexturePool,
     samplers: GpuVAddr,
     sampler_limit: u32,
+    /// The workgroup size and workgroup count of a direct compute dispatch: storage reaches that
+    /// vary per invocation are bounded at its largest ids. `None` for other stages and indirect
+    /// dispatches, which take only reaches the same for every invocation.
+    dispatch: Option<([u32; 3], [u32; 3])>,
 }
 
 impl VulkanRasterizer {
@@ -965,6 +969,7 @@ impl VulkanRasterizer {
                     },
                     samplers: regs.tex_sampler.address(),
                     sampler_limit: regs.tex_sampler.limit,
+                    dispatch: None,
                 };
                 if !self.bind_resources(&module, &sources)? {
                     return Ok(());
@@ -2969,6 +2974,7 @@ impl VulkanRasterizer {
             pool: *env.pool(),
             samplers: ctx.samplers,
             sampler_limit: ctx.sampler_limit,
+            dispatch: ctx.indirect.is_none().then_some((ctx.block, ctx.grid)),
         };
         let mut removals = self.texture_cache.removals();
         let mut retargets = 0;
@@ -3231,7 +3237,8 @@ fn numeric_mismatch(
 /// The GPU address of storage buffer `element` of `desc` and the bytes its binding reaches
 /// past it. An NVN descriptor in the constant buffer gives its size word. Any other pointer (a
 /// bare Switch 2 pointer, or an entry of a pointer table the constant buffer points to) carries
-/// no size, so it reaches what the program provably accesses, or `None` when that is unknown:
+/// no size, so it reaches what the program provably accesses (over the dispatch's ids, for a
+/// direct compute dispatch), or `None` when that is unknown:
 /// then [`BufferCache::unbounded_storage_buffer`](crate::buffer_cache::BufferCache::unbounded_storage_buffer)
 /// binds as far as it can in place. A provable reach ends on a whole word, since the host may
 /// lower byte and halfword accesses to word loads and compare-and-swap loops. No size passes
@@ -3260,8 +3267,12 @@ fn storage_pointer(
     if desc.is_written {
         extent.merge(&desc.write_extent);
     }
-    let size = extent.constant_end().map(|end| {
-        let end = (address + u64::from(end).max(1)).next_multiple_of(4);
+    let reach = match src.dispatch {
+        Some((workgroup, groups)) => extent.dispatch_end(workgroup, groups),
+        None => extent.constant_end().map(u64::from),
+    };
+    let size = reach.map(|end| {
+        let end = address.saturating_add(end.max(1)).next_multiple_of(4);
         (end - address).min(limit)
     });
     (address, size)

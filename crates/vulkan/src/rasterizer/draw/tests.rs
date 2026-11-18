@@ -1098,6 +1098,7 @@ fn texture_binding_cost_across_other_images() {
         },
         samplers: GPU_VA + TSC,
         sampler_limit: 0,
+        dispatch: None,
     };
     let desc = TextureDescriptor {
         ty: TextureType::Color2D,
@@ -2112,6 +2113,7 @@ fn cached_samplers_follow_the_anisotropy_setting() {
         },
         samplers: GPU_VA + TSC,
         sampler_limit: 0,
+        dispatch: None,
     };
     let r = &mut f.rasterizer;
     r.draw.set_anisotropy(Anisotropy::X1);
@@ -5457,8 +5459,8 @@ fn dispatches_through_unbounded_pointers_record_their_barrier_at_once() {
 
 /// Storage binding reach: an NVN descriptor takes its size word. A bare Switch 2 pointer or a
 /// pointer table entry reaches what its program provably accesses, whatever the word after the
-/// pointer holds, and is unbounded (`None`) when that is unknown or varies per invocation. No
-/// reach passes the host's range limit.
+/// pointer holds, and is unbounded (`None`) when that is unknown, or varies per invocation
+/// outside a direct compute dispatch. No reach passes the host's range limit.
 #[test]
 fn storage_pointer_reach_follows_the_program_accesses() {
     use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
@@ -5483,7 +5485,7 @@ fn storage_pointer_reach_follows_the_program_accesses() {
         size: 0x100,
         enabled: true,
     }];
-    let sources = |switch2: bool| StageSources {
+    let sources = |switch2: bool, dispatch| StageSources {
         gmmu: &gmmu,
         cbufs: &cbufs,
         root_table: None,
@@ -5495,6 +5497,7 @@ fn storage_pointer_reach_follows_the_program_accesses() {
         },
         samplers: 0,
         sampler_limit: 0,
+        dispatch,
     };
     let unknown = StorageWriteExtent::default();
     let extent = |end: u32, stride: u32| StorageWriteExtent {
@@ -5516,7 +5519,7 @@ fn storage_pointer_reach_follows_the_program_accesses() {
     };
     let direct = StorageBufferDescriptor::DIRECT;
     let reach = |switch2: bool, desc: StorageBufferDescriptor| {
-        storage_pointer(&sources(switch2), &desc, 0, u64::MAX)
+        storage_pointer(&sources(switch2, None), &desc, 0, u64::MAX)
     };
 
     cbuf(pool, 0x300);
@@ -5577,9 +5580,52 @@ fn storage_pointer_reach_follows_the_program_accesses() {
         (pool, Some(0x20))
     );
     assert_eq!(
-        storage_pointer(&sources(true), &desc(8, extent(0x44, 0), None), 0, 0x10),
+        storage_pointer(
+            &sources(true, None),
+            &desc(8, extent(0x44, 0), None),
+            0,
+            0x10
+        ),
         (pool, Some(0x10)),
         "no reach passes the host's storage buffer range"
+    );
+
+    cbuf(pool, 0);
+    let dispatched = |dispatch, desc: StorageBufferDescriptor| {
+        storage_pointer(&sources(true, dispatch), &desc, 0, u64::MAX)
+    };
+    let scan = StorageWriteExtent {
+        group_stride: [0x400, 0, 0],
+        ..extent(0x10, 4)
+    };
+    assert_eq!(
+        dispatched(Some(([64, 1, 1], [8, 1, 1])), desc(direct, scan, None)),
+        (pool, Some(0x10 + 4 * 63 + 0x400 * 7)),
+        "a direct dispatch bounds reads by invocation id at its largest ids"
+    );
+    assert_eq!(
+        dispatched(None, desc(direct, scan, None)),
+        (pool, None),
+        "an indirect dispatch's grid is not known"
+    );
+    let guarded = StorageWriteExtent {
+        guarded: true,
+        guard_const: 0xff00,
+        guard_group_stride: [1, 0, 0],
+        ..scan
+    };
+    assert_eq!(
+        dispatched(Some(([64, 1, 1], [8, 1, 1])), desc(direct, guarded, None)),
+        (pool, Some(0x10 + 4 * 63 + 0x400 * 7)),
+        "a guard that holds"
+    );
+    assert_eq!(
+        dispatched(
+            Some(([64, 1, 1], [0x200, 1, 1])),
+            desc(direct, guarded, None)
+        ),
+        (pool, None),
+        "a guard the dispatch breaks"
     );
 }
 

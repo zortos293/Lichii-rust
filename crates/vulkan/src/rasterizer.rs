@@ -856,6 +856,7 @@ impl VulkanRasterizer {
             target: ACTIVITY_TARGET,
             gpu_only_mib = counts.gpu_only.bytes >> 20,
             gpu_only_allocations = counts.gpu_only.count,
+            unbounded_reach_grown_mib = buffers.unbounded_reach_grown_bytes >> 20,
             cpu_to_gpu_mib = counts.cpu_to_gpu.bytes >> 20,
             cpu_to_gpu_allocations = counts.cpu_to_gpu.count,
             gpu_to_cpu_mib = counts.gpu_to_cpu.bytes >> 20,
