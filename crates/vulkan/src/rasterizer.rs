@@ -848,10 +848,15 @@ impl VulkanRasterizer {
             "GPU thread"
         );
         let counts = self.device.memory_counts();
-        let (stream, staging) = (
+        let (stream, staging, large) = (
             self.buffer_cache.oversized_stream(),
             self.staging.oversized(),
+            self.buffer_cache.large_stream(),
         );
+        let request_max = self
+            .staging
+            .take_request_max()
+            .max(self.buffer_cache.take_stream_request_max());
         tracing::debug!(
             target: ACTIVITY_TARGET,
             gpu_only_mib = counts.gpu_only.bytes >> 20,
@@ -864,6 +869,10 @@ impl VulkanRasterizer {
             oversized_stream_buffers = stream.count,
             oversized_staging_mib = staging.bytes >> 20,
             oversized_staging_buffers = staging.count,
+            staging_request_max_mib = request_max.div_ceil(1 << 20),
+            staging_part_slices_mib = self.staging.part_bytes() >> 20,
+            large_stream_mib = large.bytes >> 20,
+            large_stream_buffers = large.count,
             pipelines = self.device.pipelines(),
             descriptor_pools = self.device.descriptor_pools(),
             "GPU memory"
