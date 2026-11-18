@@ -242,6 +242,27 @@ impl Fixture {
         cache.tick_frame(&mut tx, || usage).unwrap();
     }
 
+    /// Ends a frame with no driver pressure and the caches' own budget derived from
+    /// `device_local` bytes of device-local heaps; `finish` waits for the GPU first.
+    fn tick_budget(&mut self, device_local: u64, finish: bool) {
+        if finish {
+            self.scheduler.finish().unwrap();
+        }
+        let usage = MemoryUsage {
+            budget: HUGE_BUDGET,
+            device_local,
+            ..MemoryUsage::default()
+        };
+        let (mut tx, cache, _) = self.tx();
+        cache.tick_frame(&mut tx, || usage).unwrap();
+    }
+
+    fn buffer(&mut self, daddr: DAddr, size: u64) -> crate::buffer_cache::BufferBinding {
+        self.buffers
+            .acquire(&mut self.scheduler, &mut self.staging, daddr, size)
+            .unwrap()
+    }
+
     fn assert_no_validation_errors(&self) {
         assert_eq!(
             self.device.instance().validation_errors(),
@@ -1966,6 +1987,351 @@ fn collector_work_per_frame_is_bounded() {
     f.tick(1);
     assert_eq!(stats(&f), (74, 24, 0));
     assert_eq!(f.cache.len(), 0);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn cache_budget_follows_the_device_local_heaps() {
+    const GIB: u64 = 1 << 30;
+    let b = |device_local, vram| CacheBudget::new(device_local, vram);
+    let want = |expected, critical| CacheBudget { expected, critical };
+    assert_eq!(
+        b(10 * GIB, VramUsage::Conservative),
+        want(4 * GIB, 5 * GIB),
+        "a 10 GiB card collects from 4 GiB, not from half of it"
+    );
+    assert_eq!(
+        b(6 * GIB, VramUsage::Conservative),
+        want(3 * GIB, 15 * GIB / 4)
+    );
+    assert_eq!(b(8 * GIB, VramUsage::Aggressive), want(5 * GIB, 6 * GIB));
+    assert_eq!(
+        b(0, VramUsage::Conservative),
+        want(u64::MAX, u64::MAX),
+        "no heap sizes, no budget"
+    );
+}
+
+/// 16 images past a budget of 8 (critical at 10): once the 12 unused ones are RECENT_AGE
+/// frames old, the least recently used go until the images hold less than the budget, and the
+/// ones used every frame stay. The driver's budget is never reached.
+#[test]
+fn collector_holds_images_to_the_cache_budget() {
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let tics: Vec<_> = (0..16)
+        .map(|i| tic(0x08, GPU_VA + i * 0x1_0000, 64, 64, 1, 1, 2))
+        .collect();
+    let ids: Vec<_> = tics.iter().map(|t| f.texture(t).0).collect();
+    let size = f.cache.get(ids[0]).unwrap().image.memory_size();
+    let device_local = 16 * size;
+    f.tick_budget(device_local, true);
+    for _ in 1..RECENT_AGE {
+        for t in &tics[12..] {
+            f.texture(t);
+        }
+        f.tick_budget(device_local, true);
+    }
+    assert_eq!(
+        f.cache.collector_stats().evicted,
+        0,
+        "nothing is old enough"
+    );
+
+    for t in &tics[12..] {
+        f.texture(t);
+    }
+    f.tick_budget(device_local, true);
+    let live: Vec<bool> = ids.iter().map(|&id| f.cache.get(id).is_some()).collect();
+    let mut want = vec![true; 16];
+    want[..9].fill(false);
+    assert_eq!(live, want, "the 9 least recently used images went");
+    assert_eq!(f.image_bytes(), 7 * size, "under the budget of 8 images");
+    assert_eq!(f.cache.collector_stats().evicted_bytes, 9 * size);
+    f.assert_no_validation_errors();
+}
+
+/// Images and buffers share one LRU order: the collector takes whichever was used longer ago,
+/// and stops once both caches together are under their budget.
+#[test]
+fn collector_evicts_images_and_buffers_in_one_lru_order() {
+    const BUFFERS: DAddr = DADDR + (32 << 20);
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let tics: Vec<_> = (0..8)
+        .map(|i| tic(0x08, GPU_VA + i * 0x1_0000, 128, 128, 1, 1, 2))
+        .collect();
+    let buffer = |i: u64| BUFFERS + i * 0x1_0000;
+    let mut images = Vec::new();
+    for frame in 0..4u64 {
+        for i in 0..4 {
+            match frame % 2 {
+                0 => images.push(f.texture(&tics[(frame / 2 * 4 + i) as usize]).0),
+                _ => {
+                    f.buffer(buffer(frame / 2 * 4 + i), 0x1_0000);
+                }
+            }
+        }
+        f.tick_budget(HUGE_BUDGET, true);
+    }
+    let size = f.cache.get(images[0]).unwrap().image.memory_size();
+    assert_eq!(f.buffers.cached().bytes, 8 * 0x1_0000);
+    let expected = 4 * size + 4 * 0x1_0000 + 1;
+    for _ in 0..RECENT_AGE {
+        f.tick_budget(2 * expected, true);
+    }
+    let live_images: Vec<bool> = images.iter().map(|&id| f.cache.get(id).is_some()).collect();
+    assert_eq!(
+        live_images,
+        [false, false, false, false, true, true, true, true],
+        "the images of frame 0 went, those of frame 2 stayed"
+    );
+    let stats = f.buffers.stats();
+    assert_eq!(
+        (stats.evicted_buffers, stats.evicted_bytes),
+        (4, 4 * 0x1_0000),
+        "the buffers of frame 1 went, those of frame 3 stayed"
+    );
+    for i in 4..8 {
+        assert!(f.buffers.is_cached(buffer(i)), "buffer {i} stayed");
+    }
+    assert!(f.image_bytes() + f.buffers.cached().bytes < expected);
+    f.assert_no_validation_errors();
+}
+
+/// An evicted texture comes back from guest memory with the same texels, and an evicted
+/// buffer with the same bytes.
+#[test]
+fn evicted_entries_reload_identically_from_guest_memory() {
+    const BUFFER: DAddr = DADDR + (32 << 20);
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let tic = tic(0x08, GPU_VA, 64, 64, 1, 1, 2);
+    f.memory
+        .write_bytes(DADDR, &pattern(64 * 64 * 4, 7))
+        .unwrap();
+    let bytes = pattern(0x1_0000, 8);
+    f.memory.write_bytes(BUFFER, &bytes).unwrap();
+    let (first, _) = f.texture(&tic);
+    let texels = f.read_image(first);
+    f.buffer(BUFFER, 0x1_0000);
+    for _ in 0..=RECENT_AGE {
+        f.tick_budget(2, true);
+    }
+    assert!(f.cache.get(first).is_none(), "the image was evicted");
+    assert!(!f.buffers.is_cached(BUFFER), "the buffer was evicted");
+
+    let (again, _) = f.texture(&tic);
+    assert_ne!(again, first);
+    assert!(
+        f.read_image(again) == texels,
+        "the same texels upload again"
+    );
+    let binding = f.buffer(BUFFER, 0x1_0000);
+    let readback = Buffer::new(
+        &f.device,
+        0x1_0000,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuToCpu,
+        "buffer readback",
+    )
+    .unwrap();
+    let cmd = f.scheduler.record().unwrap();
+    let region = [vk::BufferCopy {
+        src_offset: binding.offset,
+        dst_offset: 0,
+        size: 0x1_0000,
+    }];
+    // SAFETY: `cmd` is recording and both ranges lie inside their buffers.
+    unsafe {
+        f.device
+            .raw
+            .cmd_copy_buffer(cmd, binding.buffer, readback.raw(), &region)
+    };
+    f.scheduler.finish().unwrap();
+    assert!(
+        readback.mapped().unwrap()[..0x1_0000] == bytes[..],
+        "the same bytes upload again"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// Past the budget's critical line a GPU-modified image is written back before it goes, while
+/// a buffer holding GPU-written bytes stays until they are downloaded.
+#[test]
+fn collector_writes_back_gpu_modified_images_and_keeps_gpu_written_buffers() {
+    const BUFFER: DAddr = DADDR + (32 << 20);
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(64, 64, 2, gob);
+    let target = clear_rt_at(&mut f, GPU_VA, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL).id;
+    let binding = f.buffer(BUFFER, 0x1_0000);
+    let cmd = f.scheduler.record().unwrap();
+    // SAFETY: `cmd` is recording and the range lies inside the buffer.
+    unsafe {
+        f.device
+            .raw
+            .cmd_fill_buffer(cmd, binding.buffer, binding.offset, 0x100, 0x1234_5678)
+    };
+    transfer_to_all_barrier(&f.device, cmd);
+    f.buffers
+        .mark_gpu_written(f.scheduler.tick(), BUFFER, 0x100);
+    for _ in 0..RECENT_AGE + 3 {
+        f.tick_budget(2, true);
+    }
+    assert!(f.cache.get(target).is_none(), "the render target went");
+    assert_eq!(f.cache.collector_stats().flushed, 1, "after its write-back");
+    let tiling = Tiling::new(64, 64, 1, 4, 2, 0, gob);
+    let mut tiled = vec![0; tiling.size_bytes()];
+    f.memory.read_bytes(DADDR, &mut tiled).unwrap();
+    assert!(
+        tiled
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|t| *t == [0, 255, 0, 255]),
+        "its texels reached guest memory"
+    );
+    assert!(f.buffers.is_cached(BUFFER), "the GPU-written buffer stayed");
+    assert_eq!(f.buffers.stats().evicted_buffers, 0);
+
+    f.buffers.flush(&mut f.scheduler, BUFFER, 0x1_0000).unwrap();
+    let mut guest = vec![0; 0x100];
+    f.memory.read_bytes(BUFFER, &mut guest).unwrap();
+    assert_eq!(guest, 0x1234_5678_u32.to_le_bytes().repeat(0x40));
+    for _ in 0..RECENT_AGE {
+        f.tick_budget(2, true);
+    }
+    assert!(!f.buffers.is_cached(BUFFER), "once downloaded it goes");
+    f.assert_no_validation_errors();
+}
+
+/// Entries used by a frame whose work has not completed stay however old they get; an entry
+/// of an earlier, completed frame goes.
+#[test]
+fn collector_keeps_entries_work_in_flight_uses() {
+    const BUFFER: DAddr = DADDR + (32 << 20);
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (old, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 2));
+    f.tick_budget(2, true);
+    let (recent, _) = f.texture(&tic(0x08, GPU_VA + 0x1_0000, 64, 64, 1, 1, 2));
+    f.buffer(BUFFER, 0x1_0000);
+    assert!(
+        f.scheduler.submitted_tick().is_none(),
+        "their uploads are recorded"
+    );
+    for _ in 0..2 * RECENT_AGE {
+        f.tick_budget(2, false);
+    }
+    assert!(
+        f.cache.get(old).is_none(),
+        "the image of the completed frame went"
+    );
+    assert!(f.cache.get(recent).is_some(), "the in-flight image stayed");
+    assert!(f.buffers.is_cached(BUFFER), "the in-flight buffer stayed");
+
+    f.tick_budget(2, true);
+    assert!(f.cache.get(recent).is_none() && !f.buffers.is_cached(BUFFER));
+    f.assert_no_validation_errors();
+}
+
+/// The collector's cost per call over 2000 images and 3000 buffers: under the budget, past it
+/// with the least recently used entry too recent, past it with every visit skipped (buffers
+/// holding GPU-written bytes), and evicting its most per call:
+/// `cargo test -p lichii-vulkan --lib collector_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing"]
+fn collector_cost() {
+    const IMAGES: u64 = 2000;
+    const BUFFERS: u64 = 3000;
+    const BUFFER_BASE: DAddr = DADDR + (16 << 20);
+    let Some(mut f) =
+        fixture_with_dram(GobLayout::Tegra, AstcRecompression::Uncompressed, 256 << 20)
+    else {
+        return;
+    };
+    let call = |f: &mut Fixture, device_local: u64| {
+        let usage = MemoryUsage {
+            budget: HUGE_BUDGET,
+            device_local,
+            ..MemoryUsage::default()
+        };
+        let (mut tx, cache, _) = f.tx();
+        let start = Instant::now();
+        cache.tick_frame(&mut tx, || usage).unwrap();
+        start.elapsed().as_nanos() as f64
+    };
+    for i in 0..BUFFERS {
+        f.buffer(BUFFER_BASE + i * 0x1_0000, 0x1000);
+        f.buffers
+            .mark_gpu_written(f.scheduler.tick(), BUFFER_BASE + i * 0x1_0000, 0x1000);
+    }
+    f.scheduler.finish().unwrap();
+    call(&mut f, HUGE_BUDGET);
+    for i in 0..IMAGES {
+        f.texture(&tic(0x08, GPU_VA + i * 0x1000, 16, 16, 1, 1, 0));
+    }
+    f.scheduler.finish().unwrap();
+    let cached = f.image_bytes() + f.buffers.cached().bytes;
+    assert_eq!(f.cache.len() as u64, IMAGES);
+    assert_eq!(f.buffers.cached().count, BUFFERS);
+
+    let between = cached * 9 / 5;
+    let young = (0..BUDGET_AGE - 2)
+        .map(|_| call(&mut f, between))
+        .sum::<f64>()
+        / (BUDGET_AGE - 2) as f64;
+    assert_eq!(
+        f.cache.collector_stats().evicted,
+        0,
+        "every entry is too recent"
+    );
+    let calls = 1000;
+    let under: f64 = (0..calls).map(|_| call(&mut f, HUGE_BUDGET)).sum::<f64>() / calls as f64;
+    let skips = BUFFERS / u64::from(AGGRESSIVE_EVICTIONS * VISITS_PER_EVICTION);
+    let skipped = (0..skips).map(|_| call(&mut f, 2)).sum::<f64>() / skips as f64;
+    assert_eq!(
+        f.buffers.stats().evicted_buffers,
+        0,
+        "GPU-written buffers stay"
+    );
+    assert_eq!(
+        f.cache.collector_stats().evicted,
+        0,
+        "every visit went to an older buffer"
+    );
+
+    f.buffers
+        .flush(&mut f.scheduler, BUFFER_BASE, BUFFERS * 0x1_0000)
+        .unwrap();
+    f.scheduler.finish().unwrap();
+    let (mut total, mut max, mut evicting) = (0.0, 0.0f64, 0);
+    while f.buffers.cached().count + f.cache.image_memory().count > 0 {
+        let ns = call(&mut f, 2);
+        (total, max, evicting) = (total + ns, max.max(ns), evicting + 1);
+        f.scheduler.finish().unwrap();
+    }
+    eprintln!(
+        "collector over {IMAGES} images and {BUFFERS} buffers ({} MiB): under the budget \
+         {:.2} us; past it, nothing old enough {:.2} us; {} visits skipped {:.2} us; \
+         evicting {} a call {:.1} us mean, {:.1} us max ({:.0} ns an entry, {evicting} calls)",
+        cached >> 20,
+        under / 1e3,
+        young / 1e3,
+        AGGRESSIVE_EVICTIONS * VISITS_PER_EVICTION,
+        skipped / 1e3,
+        AGGRESSIVE_EVICTIONS,
+        total / evicting as f64 / 1e3,
+        max / 1e3,
+        total / (IMAGES + BUFFERS) as f64,
+    );
     f.assert_no_validation_errors();
 }
 

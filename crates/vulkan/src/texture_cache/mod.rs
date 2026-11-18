@@ -23,9 +23,11 @@
 //! resolution scale and are scaled back down on flush.
 //!
 //! Once per presented frame [`TextureCache::tick_frame`] runs the collector: past thresholds
-//! from the driver's memory budget and the VRAM usage setting, it evicts the least recently
-//! used images with bounded work per frame. GPU-modified ones are read back without a GPU wait
-//! and reach guest memory before they go.
+//! from the driver's memory budget, or past the caches' own budget ([`CacheBudget`]) for their
+//! images and cached buffers, it evicts the least recently used images and buffers with
+//! bounded work per frame, never ones work still in flight uses. GPU-modified images are read
+//! back without a GPU wait and reach guest memory before they go; buffers holding GPU-written
+//! bytes stay.
 
 mod astc;
 mod blit;
@@ -64,7 +66,7 @@ use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::format::{Conversion, HostFormat, host_format};
 use crate::host_budget::{PART_SLICE, Readback, STAGING_REQUEST_MAX};
-use crate::memory::{Buffer, Image, ImageDesc, ImageView, MemoryUsage, aspect_of};
+use crate::memory::{Buffer, Image, ImageDesc, ImageView, LiveMemory, MemoryUsage, aspect_of};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
 use clear::ClearPipelines;
@@ -96,6 +98,11 @@ const NIL: u32 = u32::MAX;
 /// is under the retention line (images of the last few seconds stay) and past it.
 const OLD_AGE: u64 = 150;
 const RECENT_AGE: u64 = 10;
+/// Frames an image or buffer must go unused before the collector may evict it while the
+/// caches hold more than their own budget's expected line ([`CacheBudget`]).
+const BUDGET_AGE: u64 = 30;
+/// The most a conservative [`CacheBudget`] lets the caches hold before it collects.
+const CACHE_EXPECTED_MAX: u64 = 4 << 30;
 /// Images the collector evicts per frame at most, in normal and aggressive mode; it looks at
 /// [`VISITS_PER_EVICTION`] times as many at most.
 const NORMAL_EVICTIONS: u32 = 20;
@@ -248,6 +255,43 @@ impl Thresholds {
             expected: critical - margin.min(critical / 2),
             critical,
             retain,
+        }
+    }
+}
+
+/// Device memory the texture and buffer caches may hold in images and cached buffers, apart
+/// from the driver's budget: past `expected` the collector evicts entries unused for
+/// [`BUDGET_AGE`] frames, past `critical` it turns aggressive and evicts entries unused for
+/// [`RECENT_AGE`] frames, writing GPU-modified images back first. Conservative VRAM use
+/// collects from half the device-local heaps, at most [`CACHE_EXPECTED_MAX`], and turns
+/// aggressive a quarter above that; aggressive use from 5/8 and 3/4 of them. Without heap sizes
+/// there is no budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheBudget {
+    pub expected: u64,
+    pub critical: u64,
+}
+
+impl CacheBudget {
+    pub fn new(device_local: u64, vram_usage: VramUsage) -> Self {
+        if device_local == 0 {
+            return Self {
+                expected: u64::MAX,
+                critical: u64::MAX,
+            };
+        }
+        match vram_usage {
+            VramUsage::Conservative => {
+                let expected = (device_local / 2).min(CACHE_EXPECTED_MAX);
+                Self {
+                    expected,
+                    critical: expected + expected / 4,
+                }
+            }
+            VramUsage::Aggressive => Self {
+                expected: device_local / 8 * 5,
+                critical: device_local / 4 * 3,
+            },
         }
     }
 }
@@ -792,6 +836,12 @@ pub struct TextureCache {
     pending_downloads: Vec<Download>,
     eviction_readback: Readback,
     stats: CollectorStats,
+    /// Device memory of the live images.
+    image_bytes: u64,
+    /// The frames whose work may still run, oldest first, with the tick that work completes at.
+    frame_ends: VecDeque<(u64, u64)>,
+    /// The budget the collector last ran with.
+    budget: CacheBudget,
 }
 
 /// A depth or stencil view returns its value in R and leaves G undefined, while guest
@@ -1237,6 +1287,9 @@ impl TextureCache {
             pending: None,
             pending_downloads: Vec::new(),
             eviction_readback: Readback::default(),
+            image_bytes: 0,
+            frame_ends: VecDeque::new(),
+            budget: CacheBudget::new(device.memory_usage().device_local, VramUsage::default()),
             stats: CollectorStats::default(),
         }
     }
@@ -1275,6 +1328,19 @@ impl TextureCache {
 
     pub fn collector_stats(&self) -> CollectorStats {
         self.stats
+    }
+
+    /// The caches' own budget the collector last ran with.
+    pub fn budget(&self) -> CacheBudget {
+        self.budget
+    }
+
+    /// The live images and the device memory they hold.
+    pub fn image_memory(&self) -> LiveMemory {
+        LiveMemory {
+            bytes: self.image_bytes,
+            count: (self.slots.len() - self.free.len()) as u64,
+        }
     }
 
     pub fn traffic(&self) -> Traffic {
@@ -2305,7 +2371,11 @@ impl TextureCache {
         if !image.image.is_sparse() {
             return Ok(true);
         }
-        let bound = image.image.bind(tx.scheduler, level, layers, cap)?;
+        let before = image.image.memory_size();
+        let bound = image.image.bind(tx.scheduler, level, layers, cap);
+        let grown = image.image.memory_size() - before;
+        self.image_bytes += grown;
+        let bound = bound?;
         if !bound.complete && !self.sparse_capped {
             self.sparse_capped = true;
             tracing::warn!(
@@ -2948,6 +3018,7 @@ impl TextureCache {
             generation: self.slots[index as usize].generation,
         };
         self.index_pages(id, &cached.segments);
+        self.image_bytes += cached.image.memory_size();
         self.slots[index as usize].image = Some(cached);
         self.lru_push(index);
         Ok(id)
@@ -2997,6 +3068,7 @@ impl TextureCache {
             return;
         };
         slot.generation = slot.generation.wrapping_add(1);
+        self.image_bytes -= image.image.memory_size();
         for alias in &image.aliases {
             if let Some(other) = self.get_mut(alias.id) {
                 other.aliases.retain(|a| a.id != id);
@@ -3095,6 +3167,8 @@ impl TextureCache {
         let views = std::mem::take(&mut image.views);
         image.scale = scale;
         image.access = access;
+        let size = image.image.memory_size();
+        self.image_bytes = self.image_bytes + size - old.memory_size();
         tx.scheduler.retire((views, old));
         self.replacements += 1;
         Ok(())
@@ -4198,11 +4272,12 @@ impl TextureCache {
 
     /// Runs the collector, once per presented frame. `usage` reads device memory use; it is
     /// called after the scheduler released what the GPU finished, so evicted images are no
-    /// longer counted. Past thresholds from the driver's budget and the VRAM usage setting, it
-    /// evicts images unused for a while, least recently used first, with bounded work per call;
-    /// images used this frame always stay. GPU-modified images are read back without a wait
-    /// and written to guest memory on a later call, once the copy finished and only if nothing
-    /// used them in between.
+    /// longer counted. Past thresholds from the driver's budget and the VRAM usage setting, or
+    /// past the caches' own [`CacheBudget`], it evicts images and the buffer cache's buffers
+    /// unused for a while, least recently used first, with bounded work per call; entries used
+    /// by a frame whose work has not completed always stay. GPU-modified images are read back
+    /// without a wait and written to guest memory on a later call, once the copy finished and
+    /// only if nothing used them in between; buffers holding GPU-written bytes stay.
     pub fn tick_frame(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -4215,9 +4290,20 @@ impl TextureCache {
             self.sentenced.pop_front();
             self.sentenced_bytes -= bytes;
         }
+        let end = tx
+            .scheduler
+            .submitted_tick()
+            .unwrap_or_else(|| tx.scheduler.tick());
+        self.frame_ends.push_back((self.frame, end));
+        while let Some(&(_, tick)) = self.frame_ends.front()
+            && tick <= freed
+        {
+            self.frame_ends.pop_front();
+        }
         self.finish_evictions(tx);
         let result = self.collect_garbage(tx, usage());
         self.frame += 1;
+        tx.buffers.set_frame(self.frame);
         result
     }
 
@@ -4275,16 +4361,27 @@ impl TextureCache {
         let mut used = usage
             .used
             .saturating_sub(self.sentenced_bytes + pending_bytes);
+        let mut cached =
+            (self.image_bytes + tx.buffers.cached().bytes).saturating_sub(pending_bytes);
         let limits = Thresholds::new(usage.budget, self.vram_usage);
-        if used < limits.expected {
+        let budget = CacheBudget::new(usage.device_local, self.vram_usage);
+        self.budget = budget;
+        if used < limits.expected && cached < budget.expected {
             return Ok(());
         }
-        let mut aggressive = used >= limits.critical;
-        let age = if used >= limits.retain {
+        let mut aggressive = used >= limits.critical || cached >= budget.critical;
+        let age = if used >= limits.retain || cached >= budget.critical {
             RECENT_AGE
+        } else if cached >= budget.expected {
+            BUDGET_AGE
         } else {
             OLD_AGE
         };
+        let in_flight = self
+            .frame_ends
+            .front()
+            .map_or(self.frame + 1, |&(frame, _)| frame);
+        let unused_before = (self.frame + 1).saturating_sub(age).min(in_flight);
         let mut evictions = if aggressive {
             AGGRESSIVE_EVICTIONS
         } else {
@@ -4292,45 +4389,74 @@ impl TextureCache {
         };
         let mut visits = evictions * VISITS_PER_EVICTION;
         let (mut flush_bytes, mut queued_bytes) = (0, 0);
-        let mut cursor = self.lru_head;
-        while cursor != NIL && evictions > 0 && visits > 0 {
-            visits -= 1;
-            let slot = &self.slots[cursor as usize];
-            let id = ImageId {
-                index: cursor,
-                generation: slot.generation,
+        let (mut cursor, mut buffer) = (self.lru_head, tx.buffers.lru_head());
+        while evictions > 0 && visits > 0 {
+            let image_use = (cursor != NIL).then(|| {
+                let slot = &self.slots[cursor as usize];
+                slot.image
+                    .as_ref()
+                    .expect("listed slots hold images")
+                    .last_use
+            });
+            let buffer_entry = tx.buffers.lru_entry(buffer);
+            let last_use = match (image_use, buffer_entry) {
+                (None, None) => break,
+                (image, buffer) => image
+                    .unwrap_or(u64::MAX)
+                    .min(buffer.map_or(u64::MAX, |(last_use, _)| last_use)),
             };
-            cursor = slot.next;
-            let image = slot.image.as_ref().expect("listed slots hold images");
-            if image.last_use + age > self.frame {
+            if last_use >= unused_before {
                 break;
             }
-            let bytes = image.image.memory_size();
-            if image.gpu_modified && image.downloadable() {
-                let (size, _) = image.readback_size();
-                if !aggressive
-                    || !can_flush
-                    || (flush_bytes > 0 && flush_bytes + size > MAX_FLUSH_BYTES)
-                {
+            visits -= 1;
+            let bytes = if let Some((buffer_use, next)) = buffer_entry
+                && image_use.is_none_or(|image_use| buffer_use < image_use)
+            {
+                let evicted = tx.buffers.evict(tx.scheduler, buffer);
+                buffer = next;
+                let Some(bytes) = evicted else {
                     continue;
-                }
-                flush_bytes += size;
-                queued_bytes += bytes;
-                self.pending_downloads.push(Download {
-                    id,
-                    offset: 0,
-                    modified: image.modified,
-                });
+                };
+                bytes
             } else {
-                self.evict(tx.scheduler, id);
-            }
+                let slot = &self.slots[cursor as usize];
+                let id = ImageId {
+                    index: cursor,
+                    generation: slot.generation,
+                };
+                cursor = slot.next;
+                let image = slot.image.as_ref().expect("listed slots hold images");
+                let bytes = image.image.memory_size();
+                if image.gpu_modified && image.downloadable() {
+                    let (size, _) = image.readback_size();
+                    if !aggressive
+                        || !can_flush
+                        || (flush_bytes > 0 && flush_bytes + size > MAX_FLUSH_BYTES)
+                    {
+                        continue;
+                    }
+                    flush_bytes += size;
+                    queued_bytes += bytes;
+                    self.pending_downloads.push(Download {
+                        id,
+                        offset: 0,
+                        modified: image.modified,
+                    });
+                } else if image.gpu_modified && used < limits.critical {
+                    continue;
+                } else {
+                    self.evict(tx.scheduler, id);
+                }
+                bytes
+            };
             used = used.saturating_sub(bytes);
+            cached = cached.saturating_sub(bytes);
             evictions -= 1;
-            if aggressive && used < limits.critical {
+            if aggressive && used < limits.critical && cached < budget.critical {
                 aggressive = false;
                 evictions >>= 2;
             }
-            if used < limits.expected {
+            if used < limits.expected && cached < budget.expected {
                 break;
             }
         }
