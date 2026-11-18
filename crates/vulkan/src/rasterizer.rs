@@ -848,6 +848,7 @@ impl VulkanRasterizer {
             "GPU thread"
         );
         let counts = self.device.memory_counts();
+        let objects = self.device.memory_objects();
         let (stream, staging) = (
             self.buffer_cache.oversized_stream(),
             self.staging.oversized(),
@@ -860,6 +861,8 @@ impl VulkanRasterizer {
             cpu_to_gpu_allocations = counts.cpu_to_gpu.count,
             gpu_to_cpu_mib = counts.gpu_to_cpu.bytes >> 20,
             gpu_to_cpu_allocations = counts.gpu_to_cpu.count,
+            device_blocks = objects.blocks,
+            dedicated_allocations = objects.dedicated,
             oversized_stream_mib = stream.bytes >> 20,
             oversized_stream_buffers = stream.count,
             oversized_staging_mib = staging.bytes >> 20,
