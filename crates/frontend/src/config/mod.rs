@@ -88,6 +88,7 @@ pub struct ConfigWindow {
     page: Page,
     controls: ControlsPage,
     hotkey_capture: Option<HotkeyAction>,
+    audio_devices: AudioDevices,
 }
 
 impl ConfigWindow {
@@ -108,6 +109,7 @@ impl ConfigWindow {
             page: Page::General,
             controls: ControlsPage::new(paths.input_profiles_dir()),
             hotkey_capture: None,
+            audio_devices: AudioDevices::default(),
         }
     }
 
@@ -438,18 +440,41 @@ impl ConfigWindow {
             Page::Hotkeys => hotkeys::ui(ui, &mut d.ui.hotkeys, &mut self.hotkey_capture),
             Page::Audio => {
                 section(ui, "Audio");
+                let (hosts, devices) = self.audio_devices.lists(&d.audio.host);
+                let mut refresh = false;
                 grid(ui, "audio", |ui| {
                     row(ui, "Output engine", |ui| {
                         combo(ui, "audio output", &mut d.audio.output)
                     });
+                    let cpal = d.audio.output != AudioOutput::Null;
+                    row(ui, "Backend", |ui| {
+                        ui.add_enabled_ui(cpal, |ui| {
+                            let auto = format!("Automatic ({})", hosts.first().unwrap_or(&"none"));
+                            if optional_combo(ui, "audio host", &mut d.audio.host, &auto, hosts) {
+                                d.audio.output_device = None;
+                            }
+                        })
+                    });
                     row(ui, "Output device", |ui| {
-                        optional_text(ui, &mut d.audio.output_device, "Default")
+                        ui.add_enabled_ui(cpal, |ui| {
+                            optional_combo(
+                                ui,
+                                "audio device",
+                                &mut d.audio.output_device,
+                                "Default",
+                                devices,
+                            );
+                            refresh = ui.button("Refresh").clicked();
+                        })
                     });
                     row(ui, "Volume", |ui| {
                         ui.add(egui::Slider::new(&mut d.audio.volume, 0..=200).suffix("%"))
                     });
                     row(ui, "", |ui| ui.checkbox(&mut d.audio.muted, "Mute"));
                 });
+                if refresh {
+                    self.audio_devices = AudioDevices::default();
+                }
             }
             Page::Filesystem => {
                 section(ui, "Game directories");
@@ -630,18 +655,60 @@ fn time_zone(ui: &mut Ui, zone: &mut String) {
     }
 }
 
-fn optional_text(ui: &mut Ui, value: &mut Option<String>, none: &str) {
-    let mut on = value.is_some();
-    if ui.checkbox(&mut on, "Custom").changed() {
-        *value = on.then(String::new);
-    }
-    match value {
-        Some(text) => {
-            ui.text_edit_singleline(text);
+/// A combo box of `none` and `names`; true when the value changed.
+fn optional_combo<S: AsRef<str>>(
+    ui: &mut Ui,
+    id: &str,
+    value: &mut Option<String>,
+    none: &str,
+    names: &[S],
+) -> bool {
+    let selected = match value.as_deref() {
+        None => none.to_string(),
+        Some(name) if names.iter().any(|n| n.as_ref() == name) => name.to_string(),
+        Some(name) => format!("{name} (not found)"),
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .width(280.0)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(value.is_none(), none).clicked() && value.is_some() {
+                *value = None;
+                changed = true;
+            }
+            for name in names {
+                let name = name.as_ref();
+                let on = value.as_deref() == Some(name);
+                if ui.selectable_label(on, name).clicked() && !on {
+                    *value = Some(name.to_string());
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
+/// Read on demand and on Refresh: listing devices can block.
+#[derive(Default)]
+struct AudioDevices {
+    hosts: Option<Vec<&'static str>>,
+    devices: Option<(Option<String>, Vec<String>)>,
+}
+
+impl AudioDevices {
+    fn lists(&mut self, host: &Option<String>) -> (&[&'static str], &[String]) {
+        let hosts = self
+            .hosts
+            .get_or_insert_with(lichii_audio::sink::host_names);
+        if self.devices.as_ref().is_none_or(|(of, _)| of != host) {
+            self.devices = Some((
+                host.clone(),
+                lichii_audio::sink::output_device_names(host.as_deref()),
+            ));
         }
-        None => {
-            ui.label(RichText::new(none).weak());
-        }
+        let devices = self.devices.as_ref().map_or(&[][..], |(_, d)| d);
+        (hosts, devices)
     }
 }
 

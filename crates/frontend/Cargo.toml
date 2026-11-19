@@ -10,6 +10,7 @@ name = "lichii"
 path = "src/main.rs"
 
 [dependencies]
+lichii-audio.workspace = true
 lichii-common.workspace = true
 lichii-core.workspace = true
 lichii-cpu.workspace = true

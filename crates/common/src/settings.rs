@@ -1145,6 +1145,10 @@ impl PlayerInput {
 #[serde(default)]
 pub struct AudioSettings {
     pub output: AudioOutput,
+    /// The cpal host backend to play through by name (`"PulseAudio"`, `"ALSA"`, `"WASAPI"`, ...).
+    /// `None` tries the platform default first, then the others.
+    pub host: Option<String>,
+    /// The output device by name, on [`Self::host`]. `None` is the host's default device.
     pub output_device: Option<String>,
     /// 0..=200 percent.
     pub volume: u8,
@@ -1155,6 +1159,7 @@ impl Default for AudioSettings {
     fn default() -> Self {
         Self {
             output: AudioOutput::Auto,
+            host: None,
             output_device: None,
             volume: 100,
             muted: false,

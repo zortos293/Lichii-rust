@@ -3,7 +3,7 @@
 //! A [`Sink`] owns the host streams. Each [`SinkStream`] pulls interleaved `i16` samples at
 //! 48 kHz (2 or 6 channels) from a ring the emulator thread fills with
 //! [`SinkStream::append_buffer`], and reports how far it has played so `IAudioOut` can give
-//! buffers back. The cpal sink plays through the host device named in
+//! buffers back. The cpal sink plays through the host backend and device named in
 //! [`AudioSettings`]; the null sink consumes streams in real time without a device, for headless
 //! runs and CI, and also drives every capture stream (they hear silence).
 
@@ -60,13 +60,14 @@ pub struct Sink {
 }
 
 impl Sink {
-    /// The sink the settings ask for: cpal on the configured output device (falling back to the
-    /// default device), or the null sink when the settings say so or no device can play 48 kHz.
+    /// The sink the settings ask for: cpal on the configured host and output device (falling back
+    /// to the default device), or the null sink when the settings say so or no device can play
+    /// 48 kHz.
     pub fn new(settings: &AudioSettings) -> Self {
         let host = match settings.output {
             AudioOutput::Null => None,
             AudioOutput::Auto | AudioOutput::Cpal => {
-                host::CpalOutput::open(settings.output_device.as_deref())
+                host::CpalOutput::open(settings.host.as_deref(), settings.output_device.as_deref())
             }
         };
         if host.is_none() {
@@ -167,9 +168,16 @@ impl Sink {
     }
 }
 
-/// The names of the host's output devices, for the settings UI.
-pub fn output_device_names() -> Vec<String> {
-    host::output_device_names()
+/// The cpal host backends available on this machine, by the names
+/// [`AudioSettings::host`] takes, the platform default first.
+pub fn host_names() -> Vec<&'static str> {
+    host::host_names()
+}
+
+/// The output device names of the host backend called `host` (the default backend when `None` or
+/// not available), by the names [`AudioSettings::output_device`] takes.
+pub fn output_device_names(host: Option<&str>) -> Vec<String> {
+    host::output_device_names(host)
 }
 
 fn host_volume(settings: &AudioSettings) -> f32 {
