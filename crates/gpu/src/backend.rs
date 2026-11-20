@@ -29,6 +29,7 @@ use crate::gmmu::Gmmu;
 use crate::host::Reduction;
 use crate::host1x::Syncpoints;
 use crate::lazy::LazyDeviceRanges;
+use crate::queue_trace::Event;
 use crate::semaphore_mirror::{self, FirstPage};
 use crate::throttle::Throttle;
 pub use crate::written_pages::GpuWrittenPages;
@@ -393,6 +394,18 @@ impl SemaphoreWrite {
     /// Notifies suspended acquires when this write enters the ordered queue. The renderer
     /// must use the same queue position when executing the write.
     pub fn queued(self, handles: &GpuHandles, fence: u64) {
+        if let Some(trace) = &handles.activity.queue_trace {
+            let bytes = self.size.bytes();
+            trace.record(Event::Offer(fence, self.address, bytes, self.payload));
+            if let Some(at) = handles
+                .syncpoints
+                .semaphore_mirror()
+                .mirror_address(self.address)
+            {
+                let clipped = bytes.min(semaphore_mirror::PAGE - at % semaphore_mirror::PAGE);
+                trace.record(Event::Offer(fence, at, clipped, self.payload));
+            }
+        }
         handles
             .syncpoints
             .semaphore_waiters()
@@ -466,6 +479,11 @@ impl FenceAction {
     /// write, including the mirror. Positions are nonzero and increase in execution order.
     pub fn execute_ordered(self, handles: &GpuHandles, fence: u64) {
         self.execute_inner(handles, fence);
+        if let Some(trace) = &handles.activity.queue_trace
+            && self.semaphore_write().is_some()
+        {
+            trace.record(Event::Retire(fence));
+        }
         handles.syncpoints.semaphore_waiters().publish(fence);
     }
 
@@ -495,7 +513,28 @@ impl FenceAction {
                 let mirror = handles.syncpoints.semaphore_mirror();
                 let mut page = mirror.first_page(address);
                 let mirrored = mirror.mirror_of(address);
-                if let Err(fault) = handles.lazy.write(address, bytemuck::cast_slice(words)) {
+                let result = handles.lazy.write(address, bytemuck::cast_slice(words));
+                if fence != 0
+                    && let Some(trace) = &handles.activity.queue_trace
+                {
+                    trace.record(Event::Publish(
+                        fence,
+                        address,
+                        bytes.min(8),
+                        Some(value),
+                        result.is_ok(),
+                    ));
+                    if bytes == 16 {
+                        trace.record(Event::Publish(
+                            fence,
+                            address + 8,
+                            8,
+                            Some(timestamp),
+                            result.is_ok(),
+                        ));
+                    }
+                }
+                if let Err(fault) = result {
                     tracing::warn!(?fault, "semaphore release to unmapped device memory");
                     return;
                 }
@@ -529,6 +568,11 @@ impl FenceAction {
                 let mut page = mirror.first_page(address);
                 let mirrored = mirror.mirror_of(address);
                 let Some(word) = semaphore_word(handles, address) else {
+                    if fence != 0
+                        && let Some(trace) = &handles.activity.queue_trace
+                    {
+                        trace.record(Event::Publish(fence, address, 4, None, false));
+                    }
                     tracing::warn!(
                         address,
                         "semaphore reduction on unmapped or unaligned memory"
@@ -552,6 +596,17 @@ impl FenceAction {
                     None => after,
                 };
                 drop(page);
+                if fence != 0
+                    && let Some(trace) = &handles.activity.queue_trace
+                {
+                    trace.record(Event::Publish(
+                        fence,
+                        address,
+                        4,
+                        Some(u64::from(seen)),
+                        true,
+                    ));
+                }
                 let waiters = handles.syncpoints.semaphore_waiters();
                 if seen == after {
                     waiters.written(&handles.device, address, 4, fence);
@@ -981,6 +1036,11 @@ fn mirror_release(
 ) {
     let mut kept = [None; 4];
     let mut written = 0;
+    let trace = handles
+        .activity
+        .queue_trace
+        .as_deref()
+        .filter(|_| fence != 0);
     for (index, &word) in words.iter().enumerate() {
         let address = target + 4 * index as u64;
         if !page.contains(address) {
@@ -997,6 +1057,18 @@ fn mirror_release(
         } else if let Ok(guest) = handles.device.read::<u32>(address) {
             page.keep(address, word, guest);
             kept[index] = Some(word);
+        } else {
+            written += 4;
+            continue;
+        }
+        if let Some(trace) = trace {
+            trace.record(Event::Publish(
+                fence,
+                address,
+                4,
+                Some(u64::from(word)),
+                true,
+            ));
         }
         written += 4;
     }

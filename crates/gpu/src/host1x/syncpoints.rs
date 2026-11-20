@@ -134,6 +134,7 @@ pub struct SyncpointBank {
     slots: Box<[Slot]>,
     next_serial: AtomicU64,
     latency: Option<(Arc<FenceLatency>, Stage)>,
+    trace: std::sync::OnceLock<Arc<crate::queue_trace::QueueTrace>>,
 }
 
 struct Slot {
@@ -170,7 +171,12 @@ impl SyncpointBank {
                 .collect(),
             next_serial: AtomicU64::new(0),
             latency,
+            trace: std::sync::OnceLock::new(),
         }
+    }
+
+    pub(crate) fn attach_trace(&self, trace: Arc<crate::queue_trace::QueueTrace>) {
+        let _ = self.trace.set(trace);
     }
 
     #[inline]
@@ -188,6 +194,9 @@ impl SyncpointBank {
     pub fn increment(&self, id: u32) -> Result<u32, InvalidSyncpoint> {
         let slot = self.slot(id)?;
         let value = slot.value.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        if let Some(trace) = self.trace.get() {
+            trace.record(crate::queue_trace::Event::SyncReady(id, value));
+        }
         if let Some((latency, stage)) = &self.latency {
             latency.reached(*stage, id, value);
         }

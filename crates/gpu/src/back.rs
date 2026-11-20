@@ -596,11 +596,15 @@ impl Back {
             }
             return;
         };
-        self.rasterizer.signal_fence(FenceAction::WriteSemaphore {
-            address: daddr,
-            value: payload,
-            size,
-        });
+        self.signal_host_semaphore(
+            channel.setup.id,
+            daddr,
+            FenceAction::WriteSemaphore {
+                address: daddr,
+                value: payload,
+                size,
+            },
+        );
     }
 
     /// The front is about to read `[address, address + size)`: the GPU work before it completes,
@@ -667,12 +671,26 @@ impl Back {
             tracing::warn!(address, "semaphore reduction on unmapped GPU memory");
             return;
         };
-        self.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
-            address: daddr,
-            op,
-            signed,
-            payload,
-        });
+        self.signal_host_semaphore(
+            channel.setup.id,
+            daddr,
+            FenceAction::ReduceSemaphore {
+                address: daddr,
+                op,
+                signed,
+                payload,
+            },
+        );
+    }
+
+    fn signal_host_semaphore(&mut self, channel: ChannelId, address: DAddr, action: FenceAction) {
+        if let Some(trace) = &self.activity.queue_trace {
+            trace.track_producer(&mut *self.rasterizer, channel, address, |rasterizer| {
+                rasterizer.signal_fence(action);
+            });
+        } else {
+            self.rasterizer.signal_fence(action);
+        }
     }
 
     fn side(&mut self, command: SideCommand) {

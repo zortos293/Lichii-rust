@@ -119,6 +119,7 @@ struct QueuedSubmission {
     increment: Option<SyncpointIncrement>,
     /// The value the increments reach.
     fence: Option<SyncpointFence>,
+    trace_sample: u64,
 }
 
 /// Entry buffers the inbox keeps for later submissions; more are dropped once the front is done
@@ -347,6 +348,7 @@ impl Front {
                     wait,
                     increment,
                     fence,
+                    trace_sample,
                 } = submission;
                 let Some(channel) = self
                     .channels
@@ -365,7 +367,7 @@ impl Front {
                 }
                 self.shared.inbox.recycle(entries);
                 if let Some(increment) = increment {
-                    channel.push(Work::Increment(increment, fence));
+                    channel.push(Work::Increment(increment, fence, trace_sample));
                 }
                 channel.push(Work::EndOfSubmission);
                 channel.run(&mut self.shared);
@@ -407,7 +409,7 @@ impl Front {
     fn resume(&mut self) -> bool {
         let mut resumed = false;
         for channel in self.channels.iter_mut().flatten() {
-            if channel.is_runnable(&self.shared) {
+            if channel.probe_runnable(&self.shared) {
                 channel.run(&mut self.shared);
                 resumed = true;
             } else {
@@ -430,6 +432,12 @@ pub fn flush_traps_enabled() -> bool {
 /// returns can hold forever.
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
+struct GpuThreads {
+    front: JoinHandle<()>,
+    back: Option<JoinHandle<()>>,
+    reporter: JoinHandle<()>,
+}
+
 /// The emulated GPU. Every method may be called from any thread and none waits for GPU work
 /// unless it says so; work is executed in the order it was queued.
 pub struct Gpu {
@@ -443,9 +451,9 @@ pub struct Gpu {
     references: Mutex<HashMap<ChannelId, Arc<AtomicU32>>>,
     /// The front thread, the back thread when it has one, and the activity reporter; emptied by
     /// `shutdown`.
-    threads: Mutex<Vec<JoinHandle<()>>>,
+    threads: Mutex<Option<GpuThreads>>,
     activity: Arc<Activity>,
-    /// Ids of those threads, so `shutdown` recognises a GPU thread without taking `threads`.
+    /// Front and back IDs, so `shutdown` recognises a GPU worker without taking `threads`.
     thread_ids: Vec<ThreadId>,
     /// Tells the back to drop its stream once `shutdown` starts.
     stopping: Arc<AtomicBool>,
@@ -474,7 +482,7 @@ impl Gpu {
             timestamp: Arc::new(GpuTimestamp::new(time, config.nanosecond_timestamps)),
             written_pages: host1x.written_pages.clone(),
             lazy: host1x.lazy.clone(),
-            activity: Arc::new(Activity::new()),
+            activity: Arc::new(Activity::for_gpu()),
         };
         let nx2_memory = (config.console == Console::Switch2).then(|| {
             Nx2GpuMemory::new(
@@ -488,10 +496,20 @@ impl Gpu {
         let ordered_semaphore_acquires = rasterizer.ordered_semaphore_acquires();
         let inbox = Arc::new(Inbox::new());
         handles.syncpoints.semaphore_waiters().attach(&inbox);
+        if let Some(trace) = &handles.activity.queue_trace {
+            handles
+                .syncpoints
+                .semaphore_waiters()
+                .attach_trace(trace.clone());
+            handles.syncpoints.host().attach_trace(trace.clone());
+        }
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
         let back_progress = producer.progress();
         let (side_sender, side_receiver) = mpsc::channel();
-        let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
+        let fetch_syncs = Arc::new(FetchSyncs::new(
+            inbox.clone(),
+            handles.activity.queue_trace.clone(),
+        ));
         let activity = handles.activity.clone();
         let stopping = Arc::new(AtomicBool::new(false));
         let wake = || -> Box<dyn Fn() + Send + Sync> {
@@ -539,6 +557,7 @@ impl Gpu {
                 words: Vec::new(),
                 waiters: handles.syncpoints.semaphore_waiters().clone(),
                 ordered_semaphore_acquires,
+                queue_trace: activity.queue_trace.clone(),
                 inbox: inbox.clone(),
                 syncpoints: handles.syncpoints.clone(),
                 written_pages: (config.console == Console::Switch2)
@@ -595,12 +614,11 @@ impl Gpu {
             stopping,
             cpu_reads,
             thread_ids,
-            threads: Mutex::new(
-                [Some(front), back, Some(reporter)]
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-            ),
+            threads: Mutex::new(Some(GpuThreads {
+                front,
+                back,
+                reporter,
+            })),
         }
     }
 
@@ -707,6 +725,19 @@ impl Gpu {
                 }
             });
             let mut entries = pool.pop().unwrap_or_default();
+            let trace_sample =
+                fence
+                    .zip(self.activity.queue_trace.as_deref())
+                    .map_or(0, |(fence, trace)| {
+                        let sample = trace.id();
+                        trace.record(crate::queue_trace::Event::Submit(
+                            channel.0,
+                            fence.id,
+                            fence.value,
+                            sample,
+                        ));
+                        sample
+                    });
             entries.extend_from_slice(submission.entries);
             Some(CpuCommand::Submit(
                 channel,
@@ -715,6 +746,7 @@ impl Gpu {
                     wait: submission.wait,
                     increment: submission.increment,
                     fence,
+                    trace_sample,
                 },
             ))
         });
@@ -789,13 +821,17 @@ impl Gpu {
         self.handles.device.set_flush_trap_handler(None);
         self.cpu_reads.close();
         self.inbox.close();
-        self.activity.stop();
-        if self.thread_ids.contains(&std::thread::current().id()) {
+        let trace = self.activity.queue_trace.as_deref();
+        let from_worker = self.thread_ids.contains(&std::thread::current().id());
+        if trace.is_none() || from_worker {
+            self.activity.stop();
+        }
+        if from_worker {
             tracing::error!("GPU shutdown from a GPU thread; not joining it");
             return;
         }
         let deadline = Instant::now() + STOP_TIMEOUT;
-        for thread in self.threads.lock().drain(..) {
+        let join = |thread: JoinHandle<()>| {
             while !thread.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -804,12 +840,32 @@ impl Gpu {
                     thread = thread.thread().name(),
                     "a GPU thread did not stop within {STOP_TIMEOUT:?}; leaving it"
                 );
-                continue;
+                return false;
             }
             if thread.join().is_err() {
                 tracing::error!("a GPU thread panicked");
+                return false;
             }
+            true
+        };
+        let mut handles = self.threads.lock();
+        let Some(GpuThreads {
+            front,
+            back,
+            reporter,
+        }) = handles.take()
+        else {
+            return;
+        };
+        let front_joined = join(front);
+        let back_joined = back.is_none_or(join);
+        if let Some(trace) = trace {
+            if front_joined && back_joined {
+                trace.workers_joined();
+            }
+            self.activity.stop();
         }
+        join(reporter);
     }
 
     #[cfg(test)]

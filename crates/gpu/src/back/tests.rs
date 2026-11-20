@@ -137,7 +137,7 @@ fn inline_stream(
 ) -> Stream {
     let (producer, consumer) = ring::ring(slots, MIN_RING_SLOTS);
     let (side, side_receiver) = mpsc::channel();
-    let fetch_syncs = Arc::new(FetchSyncs::new(Arc::new(Inbox::new())));
+    let fetch_syncs = Arc::new(FetchSyncs::new(Arc::new(Inbox::new()), None));
     let back = Back::new(
         rasterizer,
         handles,

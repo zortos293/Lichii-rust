@@ -29,7 +29,7 @@ use lichii_common::GpuVAddr;
 use crate::back::{BackChannelSetup, SideCommand};
 use crate::backend::{ChannelId, GpuWrittenPages, ReleaseSize};
 use crate::channel::{
-    ChannelConfig, SemaphoreAddress, SemaphoreStatus, SemaphoreWaiters, SyncpointFence,
+    Acquire, ChannelConfig, SemaphoreAddress, SemaphoreStatus, SemaphoreWaiters, SyncpointFence,
     SyncpointIncrement,
 };
 use crate::engines::EngineKind;
@@ -45,6 +45,7 @@ use crate::macros::{
     MacroDataRam, MacroEngine, MacroErrorKind, MacroHost, MacroIsa, ReadTaint, is_load_mme,
 };
 use crate::pushbuffer::{CommandParser, Flow, GpEntry, MethodCall, MethodHandler};
+use crate::queue_trace::{Event, QueueTrace};
 use crate::reg_index;
 use crate::semaphore_mirror::SemaphoreMirror;
 use crate::stream::{FetchSync, MULTI_MAX_WORDS, Stream};
@@ -76,6 +77,7 @@ pub(crate) struct FrontShared {
     pub words: Vec<u32>,
     pub waiters: Arc<SemaphoreWaiters>,
     pub ordered_semaphore_acquires: bool,
+    pub queue_trace: Option<Arc<QueueTrace>>,
     pub inbox: Arc<Inbox>,
     pub syncpoints: Arc<Syncpoints>,
     /// Switch 2: the device pages GPU work may have written. An entry on one is fetched after the
@@ -88,7 +90,7 @@ pub(crate) enum Work {
     Entry(GpEntry),
     SyncpointWait(SyncpointFence),
     /// Increments, and the fence they reach.
-    Increment(SyncpointIncrement, Option<SyncpointFence>),
+    Increment(SyncpointIncrement, Option<SyncpointFence>, u64),
     /// The renderer submits what it recorded.
     EndOfSubmission,
     /// The channel's later work uses this GPU address space.
@@ -128,6 +130,7 @@ pub(crate) struct FrontChannel {
     /// When the front first saw the current wait, and whether it reported it.
     waiting_since: Option<Instant>,
     wait_reported: bool,
+    trace_unready: u64,
 }
 
 /// What the method handler of a channel changes.
@@ -476,11 +479,15 @@ impl FrontChannel {
             fetch_synced: false,
             waiting_since: None,
             wait_reported: false,
+            trace_unready: 0,
         }
     }
 
     /// Removes the channel from the back.
     pub(crate) fn close(self, shared: &mut FrontShared) {
+        if let Some(trace) = &shared.queue_trace {
+            trace.record(Event::Close(self.id.0));
+        }
         shared.waiters.remove(self.id);
         shared.stream.side(SideCommand::DestroyChannel(self.id));
         shared.stream.deselect(self.id);
@@ -510,6 +517,18 @@ impl FrontChannel {
             None => !self.queue.is_empty(),
             Some(wait) => self.wait_dependency(wait, shared).is_some(),
         }
+    }
+
+    pub(crate) fn probe_runnable(&mut self, shared: &FrontShared) -> bool {
+        let probe = self
+            .wait
+            .and(shared.queue_trace.as_deref())
+            .map_or(0, QueueTrace::now);
+        let ready = self.is_runnable(shared);
+        if !ready && probe != 0 {
+            self.trace_unready = probe;
+        }
+        ready
     }
 
     fn wait_dependency(&self, wait: Wait, shared: &FrontShared) -> Option<u64> {
@@ -608,9 +627,17 @@ impl FrontChannel {
     /// Runs the channel until its queue is empty or it waits again.
     pub(crate) fn run(&mut self, shared: &mut FrontShared) {
         if let Some(wait) = self.wait {
+            let probe = shared.queue_trace.as_deref().map_or(0, QueueTrace::now);
             let Some(dependency) = self.wait_dependency(wait, shared) else {
+                self.trace_unready = probe;
                 return;
             };
+            if let Some(trace) = &shared.queue_trace {
+                trace.record(Event::Resume(
+                    self.id.0,
+                    std::mem::take(&mut self.trace_unready),
+                ));
+            }
             self.wait = None;
             self.waiting_since = None;
             self.wait_reported = false;
@@ -622,6 +649,9 @@ impl FrontChannel {
         }
         if self.queue.is_empty() {
             return;
+        }
+        if let Some(trace) = &shared.queue_trace {
+            trace.record(Event::Run(self.id.0));
         }
         shared.stream.select(self.id);
         while let Some(work) = self.queue.front() {
@@ -640,8 +670,13 @@ impl FrontChannel {
                         .side(SideCommand::BindAddressSpace(self.id, memory.clone()));
                     self.memory = memory;
                 }
-                Work::Increment(increment, fence) => {
+                Work::Increment(increment, fence, sample) => {
                     self.queue.pop_front();
+                    if sample != 0
+                        && let Some(trace) = &shared.queue_trace
+                    {
+                        trace.record(Event::Front(sample));
+                    }
                     if let Some(fence) = fence
                         && let Some(latency) = shared.syncpoints.fence_latency()
                     {
@@ -665,6 +700,9 @@ impl FrontChannel {
             }
         }
         shared.stream.flush_pending();
+        if let Some(trace) = &shared.queue_trace {
+            trace.record(Event::Stop(self.id.0));
+        }
     }
 
     fn run_entry(&mut self, entry: GpEntry, shared: &mut FrontShared) {
@@ -693,6 +731,9 @@ impl FrontChannel {
                         .stream
                         .synchronize_fetch(entry.address(), u64::from(length) * 4, sync);
                 self.fetch_synced = true;
+                if let Some(trace) = &shared.queue_trace {
+                    trace.record(Event::Wait(self.id.0, 'f', ticket, ticket));
+                }
                 self.wait = Some(Wait::Fetch(ticket));
                 return;
             }
@@ -909,10 +950,20 @@ impl Dispatch<'_> {
             low: self.memory.translate(address),
             high: wide.then(|| self.memory.translate(address + 4)).flatten(),
         };
+        let trace = self.shared.queue_trace.as_deref();
+        let trace_id = trace.map_or(0, QueueTrace::id);
         if ordered || device.low.is_some() {
-            self.shared
-                .waiters
-                .add(self.id, device, payload, op, wide, ordered);
+            self.shared.waiters.add(
+                self.id,
+                Acquire {
+                    address: device,
+                    payload,
+                    op,
+                    wide,
+                },
+                ordered,
+                trace_id,
+            );
         }
         if ordered {
             self.shared.stream.acquire(address, wide);
@@ -928,6 +979,16 @@ impl Dispatch<'_> {
             return Flow::Continue;
         } else {
             self.shared.stream.release_fences();
+        }
+        if let Some(trace) = trace {
+            trace.record(Event::Acquire(
+                trace_id,
+                device.contiguous(wide),
+                payload,
+                op as u8,
+                wide,
+            ));
+            trace.record(Event::Wait(self.id.0, 's', trace_id, trace_id));
         }
         *self.wait = Some(Wait::Semaphore {
             method,
@@ -970,6 +1031,10 @@ impl Dispatch<'_> {
             return Flow::Continue;
         }
         let inbox = self.shared.inbox.clone();
+        if let Some(trace) = &self.shared.queue_trace {
+            let key = u64::from(fence.id) << 32 | u64::from(fence.value);
+            trace.record(Event::Wait(self.id.0, 'y', trace.id(), key));
+        }
         let _ = bank.register_action(fence.id, fence.value, move || inbox.wake());
         *self.wait = Some(Wait::Syncpoint(fence));
         Flow::Suspend
@@ -1255,7 +1320,7 @@ mod tests {
         let (producer, consumer) = ring::ring(MIN_RING_SLOTS, MIN_RING_SLOTS);
         let (side, side_receiver) = mpsc::channel();
         let inbox = Arc::new(Inbox::new());
-        let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
+        let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone(), None));
         let back = Back::new(
             Box::new(Recorder::default()),
             &handles,
@@ -1279,6 +1344,7 @@ mod tests {
             words: Vec::new(),
             waiters: Arc::default(),
             ordered_semaphore_acquires: false,
+            queue_trace: None,
             inbox,
             syncpoints,
             written_pages: None,

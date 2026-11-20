@@ -3490,7 +3490,7 @@ fn occlusion_tests_against_a_nonzero_count_read_the_report() {
 /// the GPU's own reporter thread never takes the totals a test reads. Two must be registered:
 /// with a single dispatcher, tracing caches a callsite's interest from whichever thread first
 /// reaches it, which a parallel test with no subscriber can win.
-struct ActivityDebug;
+struct ActivityDebug(&'static str);
 
 impl tracing::Subscriber for ActivityDebug {
     fn register_callsite(
@@ -3501,7 +3501,7 @@ impl tracing::Subscriber for ActivityDebug {
     }
 
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.target() == "lichii_gpu::activity"
+        metadata.target() == self.0
     }
 
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -3525,8 +3525,8 @@ impl tracing::Subscriber for ActivityDebug {
 #[test]
 fn a_fence_latency_splits_into_parts_that_add_up_to_its_total() {
     assert!(Syncpoints::new().fence_latency().is_none());
-    let debug = tracing::Dispatch::new(ActivityDebug);
-    let _second = tracing::Dispatch::new(ActivityDebug);
+    let debug = tracing::Dispatch::new(ActivityDebug("lichii_gpu::activity"));
+    let _second = tracing::Dispatch::new(ActivityDebug("lichii_gpu::activity"));
     let mut rig = tracing::dispatcher::with_default(&debug, || Rig::deferred(Threading::Split));
     let channel = rig.channel(HostClass::Maxwell);
     let id = 8;
@@ -3561,4 +3561,142 @@ fn a_fence_latency_splits_into_parts_that_add_up_to_its_total() {
     );
     assert!(totals.back_to_done_ns >= 5_000_000, "{totals:?}");
     assert_eq!(totals.longest_ns, totals.total_ns);
+}
+
+#[test]
+fn queue_trace_observes_fifo_acquires_without_changing_guest_behavior() {
+    use crate::queue_trace::Event as Trace;
+
+    let debug = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    let _second = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    each_mode(|threading| {
+        let scenario = |mut rig: Rig| {
+            let handles = rig.gpu.handles().clone();
+            let producer = rig.channel(HostClass::Ampere);
+            let consumer = rig.channel(HostClass::Ampere);
+            let words = Pushbuffer::default()
+                .bind(0, AMPERE_3D)
+                .semaphore(SEMAPHORE, 7, 0)
+                .inc(0, 0x701, &[2]);
+            let entry = rig.entry(&words.0);
+            let fence = rig
+                .gpu
+                .submit(
+                    consumer,
+                    Submission {
+                        entries: &[entry],
+                        wait: None,
+                        increment: Some(SyncpointIncrement::fence_increment(8, false)),
+                    },
+                )
+                .unwrap();
+            assert!(rig.methods().is_empty());
+            let words = Pushbuffer::default()
+                .semaphore(SEMAPHORE, 6, 1)
+                .semaphore(SEMAPHORE, 7, 1);
+            rig.submit(producer, &words.0);
+            let methods = rig.methods();
+            assert_eq!(rig.read(SEMAPHORE), 0);
+            assert_eq!(rig.syncpoints.host().value(8), Ok(fence.value));
+            assert_eq!(rig.syncpoints.guest().value(8), Ok(0));
+            rig.complete();
+            assert_eq!(rig.read(SEMAPHORE), 7);
+            assert_eq!(rig.syncpoints.guest().value(8), Ok(fence.value));
+            let events = handles
+                .activity
+                .queue_trace
+                .as_ref()
+                .map(|trace| trace.events());
+            rig.gpu.shutdown();
+            if let Some(trace) = &handles.activity.queue_trace {
+                assert!(trace.joined_for_test());
+            }
+            (methods, events)
+        };
+        let (plain, none) = scenario(Rig::deferred(threading));
+        assert!(none.is_none(), "the debug target is off");
+        let (instrumented, events) = scenario(tracing::dispatcher::with_default(&debug, || {
+            Rig::deferred(threading)
+        }));
+        assert_eq!(instrumented, plain, "{threading:?}");
+        let events = events.expect("the debug target is on");
+        let sample = events
+            .iter()
+            .find_map(|e| match e {
+                Trace::Submit(1, 8, 2, sample) => Some(*sample),
+                _ => None,
+            })
+            .unwrap();
+        let wait = events
+            .iter()
+            .find_map(|e| match e {
+                Trace::Wait(1, 's', wait, _) => Some(*wait),
+                _ => None,
+            })
+            .unwrap();
+        let latches: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Trace::Latch(id, fifo, value, true) if *id == wait => Some((*fifo, *value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(latches, [(2, 7)], "{threading:?}");
+        assert!(events.iter().any(|e| matches!(e, Trace::Producer(2, 0, _))));
+        assert!(events.iter().any(|e| matches!(e, Trace::Retire(2))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Trace::Front(id) if *id == sample))
+        );
+    });
+}
+
+#[test]
+fn queue_trace_does_not_start_a_wait_for_an_already_satisfied_acquire() {
+    use crate::queue_trace::Event as Trace;
+
+    let debug = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    let _second = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    each_mode(|threading| {
+        let mut rig = tracing::dispatcher::with_default(&debug, || Rig::new(threading));
+        let channel = rig.channel(HostClass::Maxwell);
+        rig.memory.write(SEMAPHORE, 7u32).unwrap();
+        rig.submit(channel, &Pushbuffer::default().bind(0, MAXWELL_3D).0);
+        let words = gated(SEMAPHORE, 2);
+        rig.submit(channel, &words.0);
+        rig.events();
+        assert!(ran(&rig.log, 0x701, 2));
+        let trace = rig.gpu.handles().activity.queue_trace.as_ref().unwrap();
+        assert!(
+            !trace
+                .events()
+                .iter()
+                .any(|event| matches!(event, Trace::Wait(_, 's', _, _)))
+        );
+    });
+}
+
+#[test]
+fn queue_trace_does_not_confirm_shutdown_with_a_live_worker() {
+    let debug = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    let _second = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    let gpu = tracing::dispatcher::with_default(&debug, || Rig::deferred(Threading::Split).gpu);
+    let (entered, wait_entered) = std::sync::mpsc::channel();
+    let (leave, wait_leave) = std::sync::mpsc::channel::<()>();
+    gpu.run_in_order(move |_| {
+        entered.send(()).unwrap();
+        let _ = wait_leave.recv();
+    });
+    wait_entered.recv().unwrap();
+    gpu.shutdown();
+    leave.send(()).unwrap();
+    assert!(
+        !gpu.handles()
+            .activity
+            .queue_trace
+            .as_ref()
+            .unwrap()
+            .joined_for_test()
+    );
 }

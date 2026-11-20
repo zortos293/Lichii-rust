@@ -1653,6 +1653,7 @@ name = "lichii-gpu"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "crossbeam-channel",
  "lichii-common",
  "lichii-memory",
  "lichii-texture",
