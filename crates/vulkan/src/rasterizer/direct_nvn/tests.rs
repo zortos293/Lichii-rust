@@ -109,38 +109,43 @@ fn release(value: u32) -> FenceAction {
     }
 }
 
-struct Gate {
+struct Gates {
     device: Arc<Device>,
-    semaphore: vk::Semaphore,
-    open: bool,
+    semaphores: [Option<vk::Semaphore>; 2],
+    open: [bool; 2],
 }
 
-impl Gate {
+impl Gates {
     fn new(device: Arc<Device>) -> Self {
+        let mut gates = Self {
+            device,
+            semaphores: [None; 2],
+            open: [false; 2],
+        };
         let mut timeline =
             vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
         let info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline);
-        // SAFETY: valid semaphore create info on a live device.
-        let semaphore = unsafe { device.raw.create_semaphore(&info, None).unwrap() };
-        Self {
-            device,
-            semaphore,
-            open: false,
+        for slot in &mut gates.semaphores {
+            // SAFETY: valid semaphore create info on a live device.
+            *slot = Some(unsafe { gates.device.raw.create_semaphore(&info, None).unwrap() });
         }
+        gates
     }
 
-    fn wait(&self) -> SemaphoreWait {
+    fn wait(&self, index: usize) -> SemaphoreWait {
         SemaphoreWait {
-            semaphore: self.semaphore,
+            semaphore: self.semaphores[index].unwrap(),
             value: 1,
             stage: vk::PipelineStageFlags2::ALL_COMMANDS,
         }
     }
 
-    fn open(&mut self) {
-        if !std::mem::replace(&mut self.open, true) {
+    fn open(&mut self, index: usize) {
+        if let Some(semaphore) = self.semaphores[index]
+            && !std::mem::replace(&mut self.open[index], true)
+        {
             let info = vk::SemaphoreSignalInfo::default()
-                .semaphore(self.semaphore)
+                .semaphore(semaphore)
                 .value(1);
             // SAFETY: this owner signals the timeline once; the device only waits on it.
             unsafe { self.device.raw.signal_semaphore(&info).unwrap() };
@@ -148,16 +153,20 @@ impl Gate {
     }
 }
 
-impl Drop for Gate {
+impl Drop for Gates {
     fn drop(&mut self) {
-        self.open();
+        for index in 0..self.semaphores.len() {
+            self.open(index);
+        }
         self.device.wait_idle();
-        // SAFETY: no pending work refers to the semaphore once the device is idle.
-        unsafe { self.device.raw.destroy_semaphore(self.semaphore, None) };
+        for semaphore in self.semaphores.iter().flatten() {
+            // SAFETY: no pending work refers to these semaphores once the device is idle.
+            unsafe { self.device.raw.destroy_semaphore(*semaphore, None) };
+        }
     }
 }
 
-fn sample(r: &mut VulkanRasterizer, target: Found, readback: &Buffer, offset: u64) {
+fn sample(r: &mut VulkanRasterizer, target: Found, readback: &Buffer) {
     let image = r
         .texture_cache
         .prepare(&mut r.scheduler, target.id, ImageAccess::TRANSFER_SRC)
@@ -165,7 +174,6 @@ fn sample(r: &mut VulkanRasterizer, target: Found, readback: &Buffer, offset: u6
         .unwrap();
     let cmd = r.scheduler.record().unwrap();
     let copy = vk::BufferImageCopy::default()
-        .buffer_offset(offset)
         .image_subresource(
             vk::ImageSubresourceLayers::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -195,19 +203,21 @@ fn run_ordered(requested: bool, layout: GobLayout, expected: Route) -> Option<Ve
     let r = &mut f.rasterizer;
     let route = Route::negotiate(requested, layout, r.device.format_features(FORMAT));
     assert_eq!(route, expected);
-    let readback = Buffer::new(
-        &r.device,
-        8,
-        vk::BufferUsageFlags::TRANSFER_DST,
-        MemoryLocation::GpuToCpu,
-        "direct-nvn-order-test",
-    )
-    .unwrap();
+    let readback = [(); 2].map(|()| {
+        Buffer::new(
+            &r.device,
+            4,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuToCpu,
+            "direct-nvn-order-test",
+        )
+        .unwrap()
+    });
     let (wake, wakes) = mpsc::channel();
     r.set_fence_wake(Box::new(move || {
         let _ = wake.send(());
     }));
-    let mut gates = [Gate::new(r.device.clone()), Gate::new(r.device.clone())];
+    let mut gates = Gates::new(r.device.clone());
     let before = r.scheduler.submits();
     let mut standard = Standard::new(&memory, GREEN);
     for (i, color) in [GREEN, BLUE].into_iter().enumerate() {
@@ -224,8 +234,8 @@ fn run_ordered(requested: bool, layout: GobLayout, expected: Route) -> Option<Ve
         )
         .unwrap();
         assert_eq!(used, expected);
-        sample(r, found, &readback, i as u64 * 4);
-        r.scheduler.flush_with(&[gates[i].wait()], &[]).unwrap();
+        sample(r, found, &readback[i]);
+        r.scheduler.flush_with(&[gates.wait(i)], &[]).unwrap();
         r.flush_commands();
     }
     assert_eq!(r.scheduler.submits(), before + 2);
@@ -235,7 +245,7 @@ fn run_ordered(requested: bool, layout: GobLayout, expected: Route) -> Option<Ve
     assert_eq!(f.memory.read::<[u32; 2]>(SEMAPHORE + 4).unwrap(), [0, 0]);
     assert_eq!(f.memory.read::<[u8; 4]>(DADDR).unwrap(), [0; 4]);
 
-    gates[0].open();
+    gates.open(0);
     wakes
         .recv_timeout(TIMEOUT)
         .expect("first GPU completion wakes the existing waiter");
@@ -243,10 +253,10 @@ fn run_ordered(requested: bool, layout: GobLayout, expected: Route) -> Option<Ve
     assert_eq!(r.fences.len(), 1);
     assert_eq!(f.memory.read::<[u32; 2]>(SEMAPHORE + 4).unwrap(), [1, 0]);
     assert_eq!(f.memory.read::<[u8; 4]>(DADDR).unwrap(), [0; 4]);
-    assert_eq!(&readback.mapped().unwrap()[..4], [0, 255, 0, 255]);
+    assert_eq!(readback[0].mapped().unwrap(), [0, 255, 0, 255]);
     assert_eq!(wakes.try_recv(), Err(mpsc::TryRecvError::Empty));
 
-    gates[1].open();
+    gates.open(1);
     wakes
         .recv_timeout(TIMEOUT)
         .expect("GPU completion wakes the existing waiter");
@@ -254,7 +264,7 @@ fn run_ordered(requested: bool, layout: GobLayout, expected: Route) -> Option<Ve
     assert!(!r.has_pending_fences());
     assert_eq!(wakes.try_recv(), Err(mpsc::TryRecvError::Empty));
     assert_eq!(f.memory.read::<[u32; 2]>(SEMAPHORE + 4).unwrap(), [1, 2]);
-    assert_eq!(readback.mapped().unwrap(), [0, 255, 0, 255, 0, 0, 255, 255]);
+    assert_eq!(readback[1].mapped().unwrap(), [0, 0, 255, 255]);
 
     let tiling = Tiling::new(64, 32, 1, 4, 2, 0, layout);
     r.flush_region(DADDR, tiling.size_bytes() as u64);
@@ -268,6 +278,27 @@ fn run_ordered(requested: bool, layout: GobLayout, expected: Route) -> Option<Ve
     );
     f.assert_no_validation_errors();
     Some(bytes)
+}
+
+#[test]
+fn dropping_closed_gates_unblocks_both_submissions() {
+    let Some((mut f, _, _)) = scene(GobLayout::Switch2) else {
+        return;
+    };
+    let r = &mut f.rasterizer;
+    let gates = Gates::new(r.device.clone());
+    for index in 0..2 {
+        r.scheduler.record().unwrap();
+        r.signal_fence(release(index as u32 + 1));
+        r.scheduler.flush_with(&[gates.wait(index)], &[]).unwrap();
+    }
+    r.release_fences(false);
+    assert_eq!(r.fences.len(), 2);
+    drop(gates);
+    r.release_fences(false);
+    assert!(!r.has_pending_fences());
+    assert_eq!(f.memory.read::<[u32; 2]>(SEMAPHORE + 4).unwrap(), [1, 2]);
+    f.assert_no_validation_errors();
 }
 
 #[test]
