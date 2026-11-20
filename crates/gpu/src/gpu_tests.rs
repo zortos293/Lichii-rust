@@ -3607,6 +3607,10 @@ fn queue_trace_observes_fifo_acquires_without_changing_guest_behavior() {
                 .queue_trace
                 .as_ref()
                 .map(|trace| trace.events());
+            rig.gpu.shutdown();
+            if let Some(trace) = &handles.activity.queue_trace {
+                assert!(trace.joined_for_test());
+            }
             (methods, events)
         };
         let (plain, none) = scenario(Rig::deferred(threading));
@@ -3646,4 +3650,53 @@ fn queue_trace_observes_fifo_acquires_without_changing_guest_behavior() {
                 .any(|e| matches!(e, Trace::Front(id) if *id == sample))
         );
     });
+}
+
+#[test]
+fn queue_trace_does_not_start_a_wait_for_an_already_satisfied_acquire() {
+    use crate::queue_trace::Event as Trace;
+
+    let debug = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    let _second = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    each_mode(|threading| {
+        let mut rig = tracing::dispatcher::with_default(&debug, || Rig::new(threading));
+        let channel = rig.channel(HostClass::Maxwell);
+        rig.memory.write(SEMAPHORE, 7u32).unwrap();
+        rig.submit(channel, &Pushbuffer::default().bind(0, MAXWELL_3D).0);
+        let words = gated(SEMAPHORE, 2);
+        rig.submit(channel, &words.0);
+        rig.events();
+        assert!(ran(&rig.log, 0x701, 2));
+        let trace = rig.gpu.handles().activity.queue_trace.as_ref().unwrap();
+        assert!(
+            !trace
+                .events()
+                .iter()
+                .any(|event| matches!(event, Trace::Wait(_, 's', _, _)))
+        );
+    });
+}
+
+#[test]
+fn queue_trace_does_not_confirm_shutdown_with_a_live_worker() {
+    let debug = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    let _second = tracing::Dispatch::new(ActivityDebug("lichii_gpu::queue_trace"));
+    let gpu = tracing::dispatcher::with_default(&debug, || Rig::deferred(Threading::Split).gpu);
+    let (entered, wait_entered) = std::sync::mpsc::channel();
+    let (leave, wait_leave) = std::sync::mpsc::channel::<()>();
+    gpu.run_in_order(move |_| {
+        entered.send(()).unwrap();
+        let _ = wait_leave.recv();
+    });
+    wait_entered.recv().unwrap();
+    gpu.shutdown();
+    leave.send(()).unwrap();
+    assert!(
+        !gpu.handles()
+            .activity
+            .queue_trace
+            .as_ref()
+            .unwrap()
+            .joined_for_test()
+    );
 }

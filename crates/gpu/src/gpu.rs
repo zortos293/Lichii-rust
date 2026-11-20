@@ -432,6 +432,12 @@ pub fn flush_traps_enabled() -> bool {
 /// returns can hold forever.
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
+struct GpuThreads {
+    front: JoinHandle<()>,
+    back: Option<JoinHandle<()>>,
+    reporter: JoinHandle<()>,
+}
+
 /// The emulated GPU. Every method may be called from any thread and none waits for GPU work
 /// unless it says so; work is executed in the order it was queued.
 pub struct Gpu {
@@ -445,9 +451,9 @@ pub struct Gpu {
     references: Mutex<HashMap<ChannelId, Arc<AtomicU32>>>,
     /// The front thread, the back thread when it has one, and the activity reporter; emptied by
     /// `shutdown`.
-    threads: Mutex<Vec<JoinHandle<()>>>,
+    threads: Mutex<Option<GpuThreads>>,
     activity: Arc<Activity>,
-    /// Ids of those threads, so `shutdown` recognises a GPU thread without taking `threads`.
+    /// Front and back IDs, so `shutdown` recognises a GPU worker without taking `threads`.
     thread_ids: Vec<ThreadId>,
     /// Tells the back to drop its stream once `shutdown` starts.
     stopping: Arc<AtomicBool>,
@@ -608,12 +614,11 @@ impl Gpu {
             stopping,
             cpu_reads,
             thread_ids,
-            threads: Mutex::new(
-                [Some(front), back, Some(reporter)]
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-            ),
+            threads: Mutex::new(Some(GpuThreads {
+                front,
+                back,
+                reporter,
+            })),
         }
     }
 
@@ -816,13 +821,17 @@ impl Gpu {
         self.handles.device.set_flush_trap_handler(None);
         self.cpu_reads.close();
         self.inbox.close();
-        self.activity.stop();
-        if self.thread_ids.contains(&std::thread::current().id()) {
+        let trace = self.activity.queue_trace.as_deref();
+        let from_worker = self.thread_ids.contains(&std::thread::current().id());
+        if trace.is_none() || from_worker {
+            self.activity.stop();
+        }
+        if from_worker {
             tracing::error!("GPU shutdown from a GPU thread; not joining it");
             return;
         }
         let deadline = Instant::now() + STOP_TIMEOUT;
-        for thread in self.threads.lock().drain(..) {
+        let join = |thread: JoinHandle<()>| {
             while !thread.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -831,12 +840,32 @@ impl Gpu {
                     thread = thread.thread().name(),
                     "a GPU thread did not stop within {STOP_TIMEOUT:?}; leaving it"
                 );
-                continue;
+                return false;
             }
             if thread.join().is_err() {
                 tracing::error!("a GPU thread panicked");
+                return false;
             }
+            true
+        };
+        let mut handles = self.threads.lock();
+        let Some(GpuThreads {
+            front,
+            back,
+            reporter,
+        }) = handles.take()
+        else {
+            return;
+        };
+        let front_joined = join(front);
+        let back_joined = back.is_none_or(join);
+        if let Some(trace) = trace {
+            if front_joined && back_joined {
+                trace.workers_joined();
+            }
+            self.activity.stop();
         }
+        join(reporter);
     }
 
     #[cfg(test)]

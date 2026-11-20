@@ -965,16 +965,6 @@ impl Dispatch<'_> {
                 trace_id,
             );
         }
-        if let Some(trace) = trace {
-            trace.record(Event::Acquire(
-                trace_id,
-                device.contiguous(wide),
-                payload,
-                op as u8,
-                wide,
-            ));
-            trace.record(Event::Wait(self.id.0, 's', trace_id, trace_id));
-        }
         if ordered {
             self.shared.stream.acquire(address, wide);
         } else if semaphore_met(
@@ -989,6 +979,16 @@ impl Dispatch<'_> {
             return Flow::Continue;
         } else {
             self.shared.stream.release_fences();
+        }
+        if let Some(trace) = trace {
+            trace.record(Event::Acquire(
+                trace_id,
+                device.contiguous(wide),
+                payload,
+                op as u8,
+                wide,
+            ));
+            trace.record(Event::Wait(self.id.0, 's', trace_id, trace_id));
         }
         *self.wait = Some(Wait::Semaphore {
             method,

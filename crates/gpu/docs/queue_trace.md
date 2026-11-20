@@ -49,9 +49,11 @@ the time bracket of that call are included. An offer is when the back exposes an
 waiters, not when Vulkan recorded the entry. Missing IDs, partial mappings, unknown values
 and absent publication records stay unknown. An unordered GPU latch is labeled separately.
 
-The reporter drains up to 32,768 buffered events per tick; producers don't wait when that
-buffer fills. `status` reports cumulative drops and whether a shutdown marker was seen.
-Any reported drop or malformed record invalidates attribution for the capture. Submissions that never reached
-the front, or whose front run was cut off in the log, are emitted as partial without guessed
-buckets. An abrupt stop can lose an undrained tail; even a capture with no reported drops
-should be treated as a prefix unless the shutdown marker is present.
+The reporter drains up to 32,768 buffered events per tick. Producers don't wait when that
+buffer fills. The `status` row reports cumulative drops and whether the trace closed cleanly.
+The reporter confirms a clean close only after GPU workers have joined and no append is in
+flight. A timeout or forced stop leaves a prefix, even if no drops were reported.
+
+Any reported drop or malformed record invalidates attribution for the capture. Submissions
+that never reached the front or whose front run was cut off get partial rows without guessed
+buckets.
