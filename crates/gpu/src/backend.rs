@@ -33,6 +33,9 @@ use crate::semaphore_mirror::{self, FirstPage};
 use crate::throttle::Throttle;
 pub use crate::written_pages::GpuWrittenPages;
 
+mod nvn2;
+pub use nvn2::{Nvn2Submission, ReplayAdmission, ReplayError};
+
 /// A GPU channel (one per nvhost-gpu channel or NVN2 queue).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChannelId(pub u32);
@@ -634,6 +637,15 @@ pub trait CpuReadCompleter: Send + Sync {
 /// Methods with a default body are optional: the defaults do the work in software (copies) or
 /// nothing (hints).
 pub trait Rasterizer: Send {
+    /// Tries to record the whole NVN2 packet at the current queue position. Only
+    /// [`ReplayAdmission::UseStandard`] permits the caller to run Standard in its place.
+    fn try_replay_nvn2(
+        &mut self,
+        _submission: &Nvn2Submission,
+    ) -> Result<ReplayAdmission, ReplayError> {
+        Ok(ReplayAdmission::UseStandard)
+    }
+
     /// Whether acquires should be routed through this renderer's ordered fence queue. The
     /// default keeps the front's existing guest-memory acquire path.
     fn ordered_semaphore_acquires(&self) -> bool {

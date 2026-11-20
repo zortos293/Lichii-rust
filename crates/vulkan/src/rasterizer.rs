@@ -30,8 +30,8 @@ use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
     Blit, BlitOperation, ComputeContext, CpuReadCompleter, CpuReadDone, CpuReadTicket, DrawParams,
     DrawTexture, FenceAction, FramebufferConfig, GpuHandles, GpuPredicate, GraphicsContext,
-    ImageCopy, IndirectDraw, PendingSemaphore, Query, QueryKind, Rasterizer, ReleaseSize,
-    RenderCondition, SemaphoreWrite,
+    ImageCopy, IndirectDraw, Nvn2Submission, PendingSemaphore, Query, QueryKind, Rasterizer,
+    ReleaseSize, RenderCondition, ReplayAdmission, ReplayError, SemaphoreWrite,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -213,6 +213,7 @@ pub struct VulkanRasterizer {
     frame_uploads: Vec<(u64, Buffer)>,
     mailbox: Arc<FrameMailbox>,
     gob_layout: GobLayout,
+    nvn2_target: Option<direct_nvn::ResidentTarget>,
     frames: Vec<Arc<FrameImage>>,
     fences: VecDeque<(u64, Release)>,
     fences_retired: u64,
@@ -451,6 +452,7 @@ impl VulkanRasterizer {
             frame_uploads: Vec::new(),
             mailbox,
             gob_layout,
+            nvn2_target: None,
             frames: Vec::new(),
             fences: VecDeque::new(),
             fences_retired: 0,
@@ -1226,6 +1228,13 @@ impl VulkanRasterizer {
 }
 
 impl Rasterizer for VulkanRasterizer {
+    fn try_replay_nvn2(
+        &mut self,
+        submission: &Nvn2Submission,
+    ) -> Result<ReplayAdmission, ReplayError> {
+        self.replay_nvn2(submission)
+    }
+
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
         self.bound_oversized();
         self.activity.draws += 1;

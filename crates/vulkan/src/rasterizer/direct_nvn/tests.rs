@@ -2,18 +2,27 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use gpu_allocator::MemoryLocation;
-use lichii_gpu::backend::{ChannelId, ConstBufferBinding, GraphicsContext, ReleaseSize};
+use lichii_common::settings::GraphicsSettings;
+use lichii_gpu::backend::{
+    ChannelId, ConstBufferBinding, FenceAction, GraphicsContext, NullRasterizer, ReleaseSize,
+};
+use lichii_gpu::clock::GuestTime;
 use lichii_gpu::engines::maxwell_3d::regs::{MAX_CONST_BUFFERS, MAX_SHADER_STAGE};
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
+use lichii_gpu::gmmu::BigPageSize;
+use lichii_gpu::gpu::{Console, Gpu, GpuConfig, Threading};
+use lichii_gpu::host1x::Host1x;
+use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
 use lichii_texture::block_linear::Tiling;
 
 use super::*;
-use crate::Device;
 use crate::commands::{ImageAccess, transfer_to_all_barrier};
 use crate::memory::Buffer;
+use crate::present::FrameMailbox;
 use crate::rasterizer::tests::{DADDR, Fixture, GPU_VA, clear_regs, fixture, gmmu, guest_linear};
 use crate::scheduler::SemaphoreWait;
 use crate::texture_cache::ImageInfo;
+use crate::{Device, Instance, SurfaceSupport};
 
 const GREEN: [f32; 4] = [0., 1., 0., 1.];
 const BLUE: [f32; 4] = [0., 0., 1., 1.];
@@ -39,7 +48,7 @@ impl<'a> Standard<'a> {
         }
     }
 
-    fn record(&mut self, renderer: &mut VulkanRasterizer) {
+    fn record(&mut self, renderer: &mut dyn Rasterizer) {
         let mut ctx = GraphicsContext {
             channel: ChannelId(0),
             memory: self.memory,
@@ -83,22 +92,40 @@ fn scene(layout: GobLayout) -> Option<(Fixture, Arc<Gmmu>, Found)> {
     Some((f, memory, found))
 }
 
-fn resident<'a>(f: &Fixture, memory: &'a Gmmu, found: Found) -> ResidentTarget<'a> {
-    ResidentTarget {
+fn authorize(r: &mut VulkanRasterizer, memory: &Arc<Gmmu>, found: Found) {
+    r.nvn2_target = Some(ResidentTarget {
         found,
-        memory,
+        memory: memory.clone(),
+        address: GPU_VA,
         mapping_generation: memory.generation(),
-        cache_generation: f.rasterizer.texture_cache.generation(),
+        cache_generation: r.texture_cache.generation(),
         backing: DADDR,
+        fail_after_recording: None,
+    });
+}
+
+fn packet(memory: &Arc<Gmmu>, color: [f32; 4], fence: FenceAction) -> Nvn2Submission {
+    Nvn2Submission {
+        memory: memory.clone(),
+        target: GPU_VA,
+        mapping_generation: memory.generation(),
+        color,
+        color_mask: 0xf,
+        fence,
     }
 }
 
-fn clear<'a>(target: Option<&'a ResidentTarget<'a>>, color: [f32; 4]) -> Command<'a> {
-    Command::ClearColor {
-        target,
-        channels: vk::ColorComponentFlags::RGBA,
-        color,
+fn replay_or_standard(
+    r: &mut dyn Rasterizer,
+    packet: &Nvn2Submission,
+    standard: impl FnOnce(&mut dyn Rasterizer),
+) -> Result<ReplayAdmission, ReplayError> {
+    let admission = r.try_replay_nvn2(packet)?;
+    if admission == ReplayAdmission::UseStandard {
+        standard(r);
+        r.signal_fence(packet.fence);
     }
+    Ok(admission)
 }
 
 fn release(value: u32) -> FenceAction {
@@ -197,12 +224,12 @@ fn sample(r: &mut VulkanRasterizer, target: Found, readback: &Buffer) {
     transfer_to_all_barrier(&r.device, cmd);
 }
 
-fn run_ordered(requested: bool, layout: GobLayout, expected: Route) -> Option<Vec<u8>> {
+fn run_ordered(requested: bool, layout: GobLayout, expected: ReplayAdmission) -> Option<Vec<u8>> {
     let (mut f, memory, found) = scene(layout)?;
-    let target = resident(&f, &memory, found);
     let r = &mut f.rasterizer;
-    let route = Route::negotiate(requested, layout, r.device.format_features(FORMAT));
-    assert_eq!(route, expected);
+    if requested {
+        authorize(r, &memory, found);
+    }
     let readback = [(); 2].map(|()| {
         Buffer::new(
             &r.device,
@@ -222,16 +249,10 @@ fn run_ordered(requested: bool, layout: GobLayout, expected: Route) -> Option<Ve
     let mut standard = Standard::new(&memory, GREEN);
     for (i, color) in [GREEN, BLUE].into_iter().enumerate() {
         standard.regs.clear_color = color;
-        let used = submit(
-            r,
-            route,
-            &[clear(Some(&target), color)],
-            release(i as u32 + 1),
-            |r| {
-                assert_eq!(expected, Route::Standard);
-                standard.record(r);
-            },
-        )
+        let used = replay_or_standard(r, &packet(&memory, color, release(i as u32 + 1)), |r| {
+            assert_eq!(expected, ReplayAdmission::UseStandard);
+            standard.record(r);
+        })
         .unwrap();
         assert_eq!(used, expected);
         sample(r, found, &readback[i]);
@@ -303,15 +324,16 @@ fn dropping_closed_gates_unblocks_both_submissions() {
 
 #[test]
 fn direct_and_standard_clear_the_same_pixels_in_queue_order() {
-    let Some(standard) = run_ordered(false, GobLayout::Switch2, Route::Standard) else {
+    let Some(standard) = run_ordered(false, GobLayout::Switch2, ReplayAdmission::UseStandard)
+    else {
         return;
     };
     assert_eq!(
-        run_ordered(true, GobLayout::Switch2, Route::Direct),
+        run_ordered(true, GobLayout::Switch2, ReplayAdmission::Recorded),
         Some(standard.clone())
     );
     assert_eq!(
-        run_ordered(true, GobLayout::Tegra, Route::Standard),
+        run_ordered(true, GobLayout::Tegra, ReplayAdmission::UseStandard),
         Some(standard)
     );
 }
@@ -320,77 +342,56 @@ fn direct_and_standard_clear_the_same_pixels_in_queue_order() {
 fn rejected_submissions_enter_standard_before_recording_or_enqueuing_a_fence() {
     const REMAPPED: DAddr = DADDR + 0x40_0000;
     let layout = GobLayout::Switch2;
-    assert_eq!(Route::default(), Route::Standard);
+    assert!(!supported(vk::FormatFeatureFlags::COLOR_ATTACHMENT));
     let Some((mut f, memory, found)) = scene(layout) else {
         return;
     };
-    let target = resident(&f, &memory, found);
     let r = &mut f.rasterizer;
-    let missing = Route::negotiate(true, layout, vk::FormatFeatureFlags::COLOR_ATTACHMENT);
-    let direct = Route::negotiate(true, layout, r.device.format_features(FORMAT));
-    assert_eq!(direct, Route::Direct);
     let mut standard = Standard::new(&memory, GREEN);
-    let unsupported_resource = ResidentTarget {
-        found: Found { layer: 1, ..found },
-        ..target
-    };
     let mut calls = 0;
-    for (i, (route, commands)) in [
-        (missing, [clear(Some(&target), GREEN)].as_slice()),
-        (
-            direct,
-            [clear(Some(&target), GREEN), Command::Unsupported].as_slice(),
-        ),
-        (direct, [clear(None, GREEN)].as_slice()),
-        (
-            direct,
-            [clear(Some(&unsupported_resource), GREEN)].as_slice(),
-        ),
-        (
-            direct,
-            [Command::ClearColor {
-                target: Some(&target),
-                color: GREEN,
-                channels: vk::ColorComponentFlags::G,
-            }]
-            .as_slice(),
-        ),
-        (direct, [clear(Some(&target), BLUE)].as_slice()),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if i == 5 {
-            memory.map(GPU_VA, REMAPPED, 0x10000, 0, false).unwrap();
-            assert_ne!(memory.generation(), target.mapping_generation);
-            standard.regs.clear_color = BLUE;
+    for i in 0..4 {
+        let mut packet = packet(&memory, GREEN, release(1));
+        match i {
+            0 => assert!(r.nvn2_target.is_none()),
+            1 => {
+                authorize(r, &memory, found);
+                packet.target += 0x1000;
+            }
+            2 => packet.color_mask = 2,
+            _ => {
+                memory.map(GPU_VA, REMAPPED, 0x10000, 0, false).unwrap();
+                assert_ne!(memory.generation(), packet.mapping_generation);
+                standard.regs.clear_color = BLUE;
+                packet.color = BLUE;
+            }
         }
         let tick = r.scheduler.tick();
         let generations = r.texture_cache.generation();
         let was_modified = r.texture_cache.state(found.id).unwrap().gpu_modified;
         assert_eq!(
-            submit(r, route, commands, release(1), |r| {
-                calls += 1;
-                assert_eq!(r.scheduler.tick(), tick);
-                assert!(!r.unflushed);
-                assert_eq!(r.texture_cache.generation(), generations);
-                assert_eq!(
-                    r.texture_cache.state(found.id).unwrap().gpu_modified,
-                    was_modified
-                );
-                assert!(!r.has_pending_fences());
-                standard.record(r);
-                if commands.len() > 1 {
-                    r.barrier();
+            {
+                let used = r.try_replay_nvn2(&packet).unwrap();
+                if used == ReplayAdmission::UseStandard {
+                    calls += 1;
+                    assert_eq!(r.scheduler.tick(), tick);
+                    assert!(!r.unflushed);
+                    assert_eq!(r.texture_cache.generation(), generations);
+                    assert_eq!(
+                        r.texture_cache.state(found.id).unwrap().gpu_modified,
+                        was_modified
+                    );
+                    assert!(!r.has_pending_fences());
+                    standard.record(r);
+                    r.signal_fence(packet.fence);
                 }
-            })
-            .unwrap(),
-            Route::Standard
+                used
+            },
+            ReplayAdmission::UseStandard
         );
         assert_eq!(r.fences.len(), 1);
         r.release_fences(true);
     }
-    assert_eq!(calls, 6);
+    assert_eq!(calls, 4);
     assert_eq!(f.memory.read::<u32>(SEMAPHORE + 4).unwrap(), 1);
     let tiling = Tiling::new(64, 32, 1, 4, 2, 0, layout);
     r.flush_region(DADDR, tiling.size_bytes() as u64);
@@ -401,6 +402,143 @@ fn rejected_submissions_enter_standard_before_recording_or_enqueuing_a_fence() {
         [0, 0, 255, 255]
     );
     f.assert_no_validation_errors();
+}
+
+fn stream_device() -> Option<Arc<Device>> {
+    let device = Instance::new(true, SurfaceSupport::None)
+        .and_then(|instance| Device::new(Arc::new(instance), &GraphicsSettings::default(), None));
+    match device {
+        Ok(device) => Some(device),
+        Err(error) => {
+            assert!(
+                std::env::var_os("LICHII_REQUIRE_VALIDATION").is_none(),
+                "{error}"
+            );
+            eprintln!("skipping: {error}");
+            None
+        }
+    }
+}
+
+struct GuestClock;
+
+impl GuestTime for GuestClock {
+    fn global_time_ns(&self) -> u64 {
+        1
+    }
+}
+
+fn snapshot(r: &mut dyn Rasterizer, backing: &DeviceAddressSpace) -> ([u8; 4], [u32; 3]) {
+    let tiling = Tiling::new(64, 32, 1, 4, 2, 0, GobLayout::Switch2);
+    r.wait_for_idle();
+    r.flush_region(DADDR, tiling.size_bytes() as u64);
+    (
+        backing.read(DADDR).unwrap(),
+        backing.read(SEMAPHORE + 4).unwrap(),
+    )
+}
+
+fn ordered_stream(
+    device: &Arc<Device>,
+    threading: Threading,
+    expected: Result<ReplayAdmission, ReplayError>,
+) {
+    const DRAM: u64 = 16 << 20;
+    const RED: [f32; 4] = [1., 0., 0., 1.];
+    let physical = Arc::new(PhysicalMemory::new(DRAM).unwrap());
+    physical.commit(0, DRAM).unwrap();
+    let host1x = Host1x::new(physical, 36);
+    host1x.memory.map(DADDR, 0, DRAM);
+    let backing = host1x.memory.clone();
+    let memory = Arc::new(Gmmu::new(backing.clone(), BigPageSize::Size64K));
+    memory.map(GPU_VA, DADDR, DRAM, 0, false).unwrap();
+    let (recorded, recordings) = mpsc::channel();
+    let gpu = Gpu::new(
+        host1x,
+        Arc::new(GuestClock),
+        GpuConfig {
+            threading,
+            ..GpuConfig::new(Console::Switch2)
+        },
+        |handles| {
+            let mut r = VulkanRasterizer::new(
+                device,
+                handles,
+                Arc::new(FrameMailbox::default()),
+                GobLayout::Switch2,
+            )
+            .unwrap();
+            if expected != Ok(ReplayAdmission::UseStandard) {
+                let found = register(&mut r, &memory, &clear_regs(64, 32, 2, RED));
+                authorize(&mut r, &memory, found);
+                if expected.is_err() {
+                    r.nvn2_target.as_mut().unwrap().fail_after_recording = Some(recorded);
+                }
+            }
+            Box::new(r)
+        },
+    );
+    let prior = memory.clone();
+    gpu.run_in_order(move |r| {
+        Standard::new(&prior, RED).record(r);
+        r.signal_fence(release(1));
+    });
+    let packet = packet(&memory, GREEN, release(2));
+    assert_eq!(
+        NullRasterizer::new(gpu.handles().clone()).try_replay_nvn2(&packet),
+        Ok(ReplayAdmission::UseStandard)
+    );
+    let middle = backing.clone();
+    let (observed, middle_result) = mpsc::channel();
+    gpu.run_in_order(move |r| {
+        let prior = snapshot(r, &middle);
+        let mut fallbacks = 0;
+        let used = replay_or_standard(r, &packet, |r| {
+            fallbacks += 1;
+            Standard::new(&packet.memory, packet.color).record(r);
+        });
+        observed.send((prior, used, fallbacks)).unwrap();
+    });
+    let (observed, following_result) = mpsc::channel();
+    gpu.run_in_order(move |r| {
+        let middle = snapshot(r, &backing);
+        Standard::new(&memory, BLUE).record(r);
+        r.signal_fence(release(3));
+        observed.send((middle, snapshot(r, &backing))).unwrap();
+    });
+    let (prior, used, fallbacks) = middle_result.recv_timeout(TIMEOUT).unwrap();
+    let (middle, following) = following_result.recv_timeout(TIMEOUT).unwrap();
+    gpu.shutdown();
+    assert_eq!(prior, ([255, 0, 0, 255], [1, 0, 0]));
+    assert_eq!(used, expected);
+    assert_eq!(
+        fallbacks,
+        u8::from(expected == Ok(ReplayAdmission::UseStandard))
+    );
+    let released = if expected.is_err() { 0 } else { 2 };
+    assert_eq!(middle, ([0, 255, 0, 255], [1, released, 0]));
+    assert_eq!(following, ([0, 0, 255, 255], [1, released, 3]));
+    assert_eq!(
+        recordings.try_iter().count(),
+        usize::from(expected.is_err())
+    );
+}
+
+#[test]
+fn owned_packets_replay_or_fall_back_in_place_on_the_gpu_stream() {
+    let Some(device) = stream_device() else {
+        return;
+    };
+    for threading in [Threading::Split, Threading::Single] {
+        for expected in [
+            Ok(ReplayAdmission::Recorded),
+            Ok(ReplayAdmission::UseStandard),
+            Err(ReplayError),
+        ] {
+            ordered_stream(&device, threading, expected);
+        }
+    }
+    assert_eq!(device.instance().validation_errors(), 0);
 }
 
 #[cfg(target_os = "linux")]
@@ -426,20 +564,21 @@ fn matched_clear_submit_cost() {
     }
 
     let (mut f, memory, found) = scene(GobLayout::Switch2).expect("benchmark needs Vulkan");
-    let target = resident(&f, &memory, found);
     let r = &mut f.rasterizer;
-    let direct = Route::negotiate(true, r.gob_layout, r.device.format_features(FORMAT));
-    assert_eq!(direct, Route::Direct);
+    let routes = [ReplayAdmission::UseStandard, ReplayAdmission::Recorded];
     let mut standard = Standard::new(&memory, GREEN);
-    let workload = [clear(Some(&target), GREEN)];
+    let workload = packet(&memory, GREEN, release(1));
     let mut block = |r: &mut VulkanRasterizer, route| {
         for _ in 0..CLEARS {
-            let used = submit(r, route, &workload, release(1), |r| standard.record(r)).unwrap();
+            let used = replay_or_standard(r, &workload, |r| standard.record(r)).unwrap();
             assert_eq!(used, route);
         }
         r.flush_commands();
     };
-    for route in [Route::Standard, direct] {
+    for route in routes {
+        if route == ReplayAdmission::Recorded {
+            authorize(r, &memory, found);
+        }
         block(r, route);
         r.release_fences(true);
     }
@@ -450,7 +589,12 @@ fn matched_clear_submit_cost() {
     let mut wall_samples = [[0.; SAMPLES]; 2];
     for sample in 0..SAMPLES {
         for i in [sample % 2, 1 - sample % 2] {
-            let route = [Route::Standard, direct][i];
+            let route = routes[i];
+            if route == ReplayAdmission::Recorded {
+                authorize(r, &memory, found);
+            } else {
+                r.nvn2_target = None;
+            }
             let traffic = r.texture_cache.traffic();
             let submits = r.scheduler.submits();
             let mut cpu = 0;
@@ -472,14 +616,14 @@ fn matched_clear_submit_cost() {
             wall_samples[i][sample] = wall.as_nanos() as f64 / TOTAL as f64;
         }
     }
-    for (route, (cpu, wall)) in [Route::Standard, direct]
+    for (route, (cpu, wall)) in ["Standard", "Direct"]
         .into_iter()
         .zip(cpu_samples.iter_mut().zip(wall_samples.iter_mut()))
     {
         cpu.sort_by(f64::total_cmp);
         wall.sort_by(f64::total_cmp);
         eprintln!(
-            "{route:?}: {:.1} recorder CPU ns / logical submit, {:.1} wall ns / logical submit; \
+            "{route}: {:.1} recorder CPU ns / logical submit, {:.1} wall ns / logical submit; \
              {TOTAL} clears in {BLOCKS} Vulkan submits per sample; no new cache images, no change \
              in live Vulkan allocations, no guest texture upload/writeback bytes in the timed loop",
             cpu[SAMPLES / 2],
