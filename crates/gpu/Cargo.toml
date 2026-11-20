@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+testing = []
+
 [dependencies]
 bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
 crossbeam-channel.workspace = true

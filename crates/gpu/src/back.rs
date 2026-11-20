@@ -44,10 +44,15 @@ pub(crate) struct BackChannelSetup {
 /// Work the CPU side runs on the back thread with the renderer.
 pub(crate) type RasterizerAction = Box<dyn FnOnce(&mut dyn Rasterizer) + Send>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
+pub(crate) type Nvn2Fallback =
+    Box<dyn FnOnce(&mut dyn Rasterizer) -> Result<(), crate::backend::ReplayError> + Send>;
+
+#[cfg(any(test, feature = "testing"))]
 pub(crate) struct Nvn2Work {
     pub packet: crate::backend::Nvn2Submission,
-    pub standard: RasterizerAction,
+    pub standard: Option<Nvn2Fallback>,
+    pub lease: Option<(crate::nx2_memory::Nvn2TargetLease, u32)>,
     pub done: mpsc::Sender<Result<crate::backend::ReplayAdmission, crate::backend::ReplayError>>,
 }
 
@@ -60,7 +65,7 @@ pub(crate) enum SideCommand {
     UnmapRegion(DAddr, u64),
     Present(FramebufferConfig),
     Run(RasterizerAction),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     Nvn2(ChannelId, Box<Nvn2Work>),
     /// The macro code the current channel's [`tag::MACRO`] records run.
     MacroCode(Box<MacroEngine>),
@@ -750,26 +755,59 @@ impl Back {
                 self.timestamp.frame_presented();
             }
             SideCommand::Run(action) => action(&mut *self.rasterizer),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             SideCommand::Nvn2(id, work) => {
-                use crate::backend::ReplayAdmission;
+                use crate::backend::{ReplayAdmission, ReplayError};
 
                 let Nvn2Work {
                     packet,
                     standard,
+                    lease,
                     done,
                 } = *work;
-                assert!(self.channel().is_some_and(|channel| {
+                if !self.channel().is_some_and(|channel| {
                     channel.setup.id == id && Arc::ptr_eq(&channel.setup.memory, &packet.memory)
-                }));
-                let result = self.rasterizer.try_replay_nvn2(&packet);
-                match result {
-                    Ok(ReplayAdmission::UseStandard) => {
-                        standard(&mut *self.rasterizer);
-                        self.rasterizer.signal_fence(packet.fence);
+                }) {
+                    let _ = done.send(Err(ReplayError));
+                    return;
+                }
+                let completion = lease.as_ref().map(|(_, id)| {
+                    self.syncpoints
+                        .guest()
+                        .value(*id)
+                        .expect("validated fixture syncpoint")
+                        .wrapping_add(1)
+                });
+                let mut recorded = true;
+                let result = self
+                    .rasterizer
+                    .try_replay_nvn2(&packet)
+                    .and_then(|admission| {
+                        if admission == ReplayAdmission::UseStandard {
+                            recorded = false;
+                            if let Some(standard) = standard {
+                                standard(&mut *self.rasterizer)?;
+                                self.rasterizer.signal_fence(packet.fence);
+                                recorded = true;
+                            }
+                        }
+                        Ok(admission)
+                    });
+                if result.is_err() {
+                    self.stopping.store(true, Ordering::Release);
+                }
+                if let Some((lease, id)) = lease {
+                    if result.is_err() {
+                        lease.fail();
+                    } else if recorded {
+                        lease.after_fence(
+                            &self.syncpoints,
+                            id,
+                            completion.expect("leased work has a fence"),
+                        );
+                    } else {
+                        drop(lease);
                     }
-                    Ok(ReplayAdmission::Recorded) => {}
-                    Err(_) => self.stopping.store(true, Ordering::Relaxed),
                 }
                 let _ = done.send(result);
             }

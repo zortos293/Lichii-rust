@@ -1235,6 +1235,33 @@ impl Rasterizer for VulkanRasterizer {
         self.replay_nvn2(submission)
     }
 
+    fn finish_nvn2_backing(&mut self, addr: DAddr, size: u64) -> Result<(), ReplayError> {
+        if crate::debug::device_is_lost()
+            || size == 0
+            || addr.checked_add(size).is_none()
+            || self.handles.device.contiguous_pointer(addr, size).is_none()
+        {
+            return Err(ReplayError);
+        }
+        let buffer_writes = self.buffer_cache.is_gpu_written(addr, size);
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
+        };
+        self.texture_cache
+            .flush_nvn2(&mut tx, addr, size, buffer_writes)?;
+        self.buffer_cache
+            .flush(&mut self.scheduler, addr, size)
+            .map_err(|error| {
+                tracing::error!(%error, "writing back native NVN2 buffers failed");
+                ReplayError
+            })?;
+        self.unmap_region(addr, size);
+        Ok(())
+    }
+
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
         self.bound_oversized();
         self.activity.draws += 1;

@@ -31,6 +31,11 @@ use crate::nx2_memory::{AddressSpaceId, Nx2GpuMemory};
 use crate::ring;
 use crate::stream::{FetchSyncs, Link, MIN_RING_SLOTS, Stream};
 
+#[cfg(any(test, feature = "testing"))]
+mod nvn2_test;
+#[cfg(any(test, feature = "testing"))]
+pub use nvn2_test::{Nvn2TestSpace, Nvn2TestWork};
+
 /// Default ring size: 8 MiB of slots.
 pub const DEFAULT_RING_SLOTS: usize = 1 << 20;
 /// How long the front first sleeps while every channel with work waits, doubling up to
@@ -107,7 +112,7 @@ enum CpuCommand {
     DestroyChannel(ChannelId),
     BindAddressSpace(ChannelId, Arc<Gmmu>),
     Submit(ChannelId, QueuedSubmission),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     SubmitNvn2(ChannelId, Box<crate::back::Nvn2Work>),
     Side(SideCommand),
     Synchronize(mpsc::SyncSender<()>),
@@ -200,8 +205,10 @@ impl Inbox {
     fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
-        state.commands.clear();
+        let commands = std::mem::take(&mut state.commands);
         self.cond.notify_one();
+        drop(state);
+        drop(commands);
     }
 
     /// Holds the commands, and the front, while `paused`.
@@ -374,7 +381,7 @@ impl Front {
                 channel.push(Work::EndOfSubmission);
                 channel.run(&mut self.shared);
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             CpuCommand::SubmitNvn2(id, work) => {
                 if let Some(channel) = self
                     .channels
@@ -457,7 +464,7 @@ struct GpuThreads {
 pub struct Gpu {
     host1x: Host1x,
     handles: GpuHandles,
-    nx2_memory: Option<Nx2GpuMemory>,
+    nx2_memory: Option<Arc<Nx2GpuMemory>>,
     /// Switch 2 address spaces registered with `nx2_memory`.
     address_spaces: Mutex<Vec<(Arc<Gmmu>, AddressSpaceId)>>,
     inbox: Arc<Inbox>,
@@ -499,13 +506,15 @@ impl Gpu {
             activity: Arc::new(Activity::for_gpu()),
         };
         let nx2_memory = (config.console == Console::Switch2).then(|| {
-            Nx2GpuMemory::new(
+            Arc::new(Nx2GpuMemory::new(
                 host1x.memory.clone(),
                 host1x.allocator.clone(),
                 host1x.syncpoints.semaphore_mirror().clone(),
                 host1x.lazy.clone(),
-            )
+            ))
         });
+        #[cfg(any(test, feature = "testing"))]
+        let nvn2_worker = nx2_memory.clone().map(nvn2_test::Worker::new);
         let mut rasterizer = renderer(handles.clone());
         let ordered_semaphore_acquires = rasterizer.ordered_semaphore_acquires();
         let inbox = Arc::new(Inbox::new());
@@ -552,9 +561,13 @@ impl Gpu {
         );
         let (link, back) = match config.threading {
             Threading::Split => {
+                #[cfg(any(test, feature = "testing"))]
+                let nvn2_worker = nvn2_worker.clone();
                 let thread = std::thread::Builder::new()
                     .name("gpu-back".into())
                     .spawn(move || {
+                        #[cfg(any(test, feature = "testing"))]
+                        let _nvn2_worker = nvn2_worker;
                         set_current_thread_priority(ThreadPriority::AboveNormal);
                         back.run_thread(consumer)
                     })
@@ -587,6 +600,8 @@ impl Gpu {
         let front = std::thread::Builder::new()
             .name("gpu-front".into())
             .spawn(move || {
+                #[cfg(any(test, feature = "testing"))]
+                let _nvn2_worker = nvn2_worker;
                 set_current_thread_priority(ThreadPriority::AboveNormal);
                 front.run(front_inbox)
             })
@@ -649,7 +664,7 @@ impl Gpu {
 
     /// The Switch 2 GPU memory registry (gsv gpu sessions); `None` on Switch 1.
     pub fn nx2_memory(&self) -> Option<&Nx2GpuMemory> {
-        self.nx2_memory.as_ref()
+        self.nx2_memory.as_deref()
     }
 
     /// A new GPU address space on host1x's device memory. On Switch 2 it receives the mappings
@@ -800,6 +815,42 @@ impl Gpu {
     /// Runs `action` on the back thread after the work queued before it.
     pub fn run_in_order(&self, action: impl FnOnce(&mut dyn Rasterizer) + Send + 'static) {
         self.side(SideCommand::Run(Box::new(action)));
+    }
+
+    /// Schedules retirement of the old native mapping after its last host use. The callback
+    /// reports success only after writeback, renderer invalidation and the registry change.
+    pub fn retire_nvn2_backing(
+        self: &Arc<Self>,
+        retire: crate::nx2_memory::Nvn2Retirement,
+        complete: impl FnOnce() + Send + 'static,
+    ) {
+        let gpu = Arc::downgrade(self);
+        retire.when_quiescent(Box::new(move |retire| {
+            if let Some(gpu) = gpu.upgrade() {
+                let weak = Arc::downgrade(&gpu);
+                gpu.run_in_order(move |renderer| {
+                    let Some(gpu) = weak.upgrade() else { return };
+                    let Some(memory) = gpu.nx2_memory() else {
+                        return;
+                    };
+                    let Some((addr, size)) = memory.nvn2_retirement_range(&retire) else {
+                        return;
+                    };
+                    let result = renderer.finish_nvn2_backing(addr, size).and_then(|()| {
+                        memory.finish_nvn2_retirement(retire).map_err(|error| {
+                            tracing::error!(%error, "retiring the native NVN2 mapping failed");
+                            crate::backend::ReplayError
+                        })
+                    });
+                    if result.is_err() {
+                        tracing::error!("NVN2 retirement failed; abandoning the GPU session");
+                        gpu.shutdown();
+                    } else if !gpu.stopping.load(Ordering::Acquire) {
+                        complete();
+                    }
+                });
+            }
+        }));
     }
 
     /// Returns once everything queued so far ran, except the work of channels still waiting on a

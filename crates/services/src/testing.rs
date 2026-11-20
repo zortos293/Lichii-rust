@@ -9,7 +9,7 @@ use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
 use lichii_common::{ConsoleGeneration, HleResult, ResultCode, VAddr};
 use lichii_fs::nacp::Nacp;
-use lichii_gpu::backend::NullRasterizer;
+use lichii_gpu::backend::{GpuHandles, NullRasterizer, Rasterizer};
 use lichii_gpu::host1x::Host1x;
 use lichii_gpu::{Console, Gpu, GpuConfig};
 use lichii_input::hub::NpadHub;
@@ -55,6 +55,17 @@ pub fn context_with_session(
     settings: Settings,
     session: Arc<dyn crate::SessionEvents>,
 ) -> (Arc<ServiceContext>, IpcClient) {
+    context_with_renderer(program, settings, session, |handles| {
+        Box::new(NullRasterizer::new(handles))
+    })
+}
+
+pub(crate) fn context_with_renderer(
+    program: ProgramImage,
+    settings: Settings,
+    session: Arc<dyn crate::SessionEvents>,
+    renderer: impl FnOnce(GpuHandles) -> Box<dyn Rasterizer>,
+) -> (Arc<ServiceContext>, IpcClient) {
     let generation = ConsoleGeneration::from_program_id(program.program_id);
     let kernel = testing::kernel(generation);
     let program = Arc::new(program);
@@ -65,12 +76,7 @@ pub fn context_with_session(
     };
     let host1x = Host1x::new(kernel.physical_memory().clone(), bits);
     host1x.memory.attach_process(process.memory().clone());
-    let gpu = Gpu::new(
-        host1x,
-        Arc::new(Clock),
-        GpuConfig::new(console),
-        |handles| Box::new(NullRasterizer::new(handles)),
-    );
+    let gpu = Gpu::new(host1x, Arc::new(Clock), GpuConfig::new(console), renderer);
     let client = IpcClient::new(&kernel, &process);
     let context = ServiceContext::new(ServiceParts {
         kernel,

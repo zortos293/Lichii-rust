@@ -27,4 +27,5 @@ tzdb_data.workspace = true
 
 [dev-dependencies]
 lichii-cpu.workspace = true
+lichii-gpu = { workspace = true, features = ["testing"] }
 lichii-kernel = { workspace = true, features = ["testing"] }

@@ -27,7 +27,9 @@ use lichii_gpu::Gpu;
 use lichii_gpu::backend::{FenceAction, Rasterizer};
 use lichii_gpu::host1x::Syncpoints;
 use lichii_gpu::lazy::LazyBlock;
-use lichii_gpu::nx2_memory::{GpuMemoryHandle, Nx2GpuMemory, Nx2MemoryError, Unmapped};
+use lichii_gpu::nx2_memory::{
+    GpuMemoryHandle, Nvn2Mutation, Nvn2RetirementAdmission, Nx2GpuMemory, Nx2MemoryError, Unmapped,
+};
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
 use lichii_memory::AddressSpace;
@@ -203,6 +205,9 @@ impl GpuSession {
                 if let Some(id) = pending {
                     state.pending.lock().remove(id);
                 }
+                if done.refused {
+                    return;
+                }
                 let wait = (destructive && !done.unmapped.is_empty()) || !done.released.is_empty();
                 let detached = reserve
                     .as_ref()
@@ -234,6 +239,30 @@ impl GpuSession {
             .clone()
     }
 
+    fn defer_nvn2_mutation(&self, slot: u32, mutation: Nvn2Mutation) -> Option<ResultCode> {
+        match self.memory()?.begin_nvn2_retirement(mutation) {
+            Nvn2RetirementAdmission::Untracked => None,
+            Nvn2RetirementAdmission::Refused => Some(lichii_kernel::result::BUSY),
+            Nvn2RetirementAdmission::Deferred(retire) => {
+                let event = self.slot(slot).clone();
+                self.context
+                    .gpu
+                    .retire_nvn2_backing(retire, move || event.signal());
+                Some(ResultCode::SUCCESS)
+            }
+        }
+    }
+
+    fn nvn2_range_is_protected(&self, (first, last): (GpuVAddr, GpuVAddr)) -> bool {
+        self.memory().is_some_and(|memory| {
+            memory.nvn2_mapping_is_protected(
+                None,
+                first,
+                last.saturating_sub(first).saturating_add(1),
+            )
+        })
+    }
+
     /// 214 without the sparse flag: makes [`start`, +`size`) a lazy region, in order. The reserve
     /// its blocks come from is started on the first one and topped up here, on the service
     /// thread, so the region's first writes find memory ready.
@@ -256,9 +285,7 @@ impl GpuSession {
                     );
                     done.unmapped = replaced;
                 }
-                Err(err) => {
-                    tracing::warn!("nx2:gpu 214: GPU-only region {start:#x}+{size:#x}: {err}")
-                }
+                Err(err) => done.error("214", err),
             },
         );
     }
@@ -281,7 +308,7 @@ impl GpuSession {
     fn create_memory(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let words = Words::command(ctx);
         let (first, last) = (words.u64(2), words.u64(4));
-        let size = last.checked_sub(first).and_then(|n| n.checked_add(1));
+        let size = inclusive_len(first, last);
         let Some(size) = size.filter(|&size| first.checked_add(size).is_some()) else {
             tracing::warn!("nx2:gpu 101: bad range [{first:#x}, {last:#x}]");
             return lichii_kernel::result::INVALID_SIZE;
@@ -289,6 +316,9 @@ impl GpuSession {
         let Some(memory) = self.memory() else {
             return lichii_kernel::result::NOT_FOUND;
         };
+        if memory.nvn2_mapping_is_protected(None, first, size) {
+            return lichii_kernel::result::BUSY;
+        }
         let Ok(handle) = memory.reserve_handle() else {
             tracing::warn!("nx2:gpu 101 [{first:#x}, {last:#x}]: no memory handle left");
             return lichii_kernel::result::OUT_OF_RESOURCE;
@@ -323,6 +353,7 @@ impl GpuSession {
                 ctx.push(handle.raw());
                 ResultCode::SUCCESS
             }
+            Err(Nx2MemoryError::Nvn2TargetInUse { .. }) => lichii_kernel::result::BUSY,
             Err(err) => {
                 tracing::warn!("nx2:gpu 101 [{first:#x}, {last:#x}]: {err}");
                 lichii_kernel::result::OUT_OF_RESOURCE
@@ -353,6 +384,15 @@ impl GpuSession {
                 }
             })
             .collect();
+        let protected = |memory: &Nx2GpuMemory, requests: &[SparseMap]| {
+            memory.nvn2_mappings_are_protected(requests.iter().map(|r| (r.handle, r.va, r.size)))
+        };
+        if self
+            .memory()
+            .is_some_and(|memory| protected(memory, &requests))
+        {
+            return lichii_kernel::result::BUSY;
+        }
         let count = requests.len();
         if count != 0 && ctx.writable_buffer(0).is_some() {
             let kinds: Vec<u8> = requests.iter().map(|r| r.kind).collect();
@@ -366,6 +406,10 @@ impl GpuSession {
             })
             .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
         self.in_order(Some(slot), true, hull, move |memory, done| {
+            if protected(memory, &requests) {
+                done.refused = true;
+                return;
+            }
             for SparseMap {
                 va,
                 size,
@@ -382,14 +426,15 @@ impl GpuSession {
                         Ok(replaced) => {
                             done.unmapped.extend(replaced);
                             if let Err(err) = memory.modify_kind(va, last, kind) {
-                                tracing::warn!("nx2:gpu 216: kind {kind:#x} at {va:#x}: {err}");
+                                done.error("216", err);
                             }
                         }
-                        Err(err) => tracing::warn!("nx2:gpu 216: {err}"),
+                        Err(err) => done.error("216", err),
                     },
-                    None => done
-                        .unmapped
-                        .extend(logged("216", memory.unmap_4k(va, last))),
+                    None => done.record("216", memory.unmap_4k(va, last)),
+                }
+                if done.refused {
+                    break;
                 }
             }
         });
@@ -404,6 +449,21 @@ struct Change {
     unmapped: Vec<Unmapped>,
     /// Lazy blocks whose memory goes back to the pool once the host GPU is past them.
     released: Vec<LazyBlock>,
+    refused: bool,
+}
+
+impl Change {
+    fn record(&mut self, request: &str, result: Result<Vec<Unmapped>, Nx2MemoryError>) {
+        match result {
+            Ok(unmapped) => self.unmapped.extend(unmapped),
+            Err(err) => self.error(request, err),
+        }
+    }
+
+    fn error(&mut self, request: &str, err: Nx2MemoryError) {
+        self.refused |= matches!(err, Nx2MemoryError::Nvn2TargetInUse { .. });
+        tracing::warn!("nx2:gpu {request}: {err}");
+    }
 }
 
 /// One of 216's SparseMapRequests.
@@ -415,13 +475,8 @@ struct SparseMap {
     kind: u8,
 }
 
-/// A request's unmapped ranges, or none after logging why it failed. Failures still complete the
-/// job, as the reference does: the SDK aborts on an error reply.
-fn logged(request: &str, result: Result<Vec<Unmapped>, Nx2MemoryError>) -> Vec<Unmapped> {
-    result.unwrap_or_else(|err| {
-        tracing::warn!("nx2:gpu {request}: {err}");
-        Vec::new()
-    })
+fn inclusive_len(first: u64, last: u64) -> Option<u64> {
+    last.checked_sub(first)?.checked_add(1)
 }
 
 impl Service for GpuSession {
@@ -486,45 +541,68 @@ impl Service for GpuSession {
                     return Some(lichii_kernel::result::NOT_FOUND);
                 }
                 let range = (words.u64(3), words.u64(5));
+                if matches!(command, 212..=215) && self.nvn2_range_is_protected(range) {
+                    return Some(lichii_kernel::result::BUSY);
+                }
                 match command {
                     101 => self.create_memory(ctx),
                     102 => {
                         let handle = GpuMemoryHandle::new(words.u32(2));
-                        self.in_order(Some(words.u32(3)), true, None, move |memory, done| {
-                            match handle {
-                                Some(handle) => {
-                                    done.unmapped = logged("102", memory.destroy(handle))
-                                }
-                                None => tracing::warn!("nx2:gpu 102: memory handle 0"),
-                            }
+                        let slot = words.u32(3);
+                        if let Some(result) = handle.and_then(|handle| {
+                            self.defer_nvn2_mutation(slot, Nvn2Mutation::Destroy(handle))
+                        }) {
+                            return Some(result);
+                        }
+                        self.in_order(Some(slot), true, None, move |memory, done| match handle {
+                            Some(handle) => done.record("102", memory.destroy(handle)),
+                            None => tracing::warn!("nx2:gpu 102: memory handle 0"),
                         });
                         ResultCode::SUCCESS
                     }
                     211 => {
                         let (handle, offset) = (GpuMemoryHandle::new(words.u32(7)), words.u64(8));
-                        self.in_order(
-                            Some(words.u32(17)),
-                            false,
-                            Some(range),
-                            move |memory, done| match handle {
+                        let slot = words.u32(17);
+                        if let Some(handle) = handle {
+                            if let Some(result) = self.defer_nvn2_mutation(
+                                slot,
+                                Nvn2Mutation::Remap {
+                                    first: range.0,
+                                    last: range.1,
+                                    handle,
+                                    offset,
+                                },
+                            ) {
+                                return Some(result);
+                            }
+                        } else if self.nvn2_range_is_protected(range) {
+                            return Some(lichii_kernel::result::BUSY);
+                        }
+                        self.in_order(Some(slot), false, Some(range), move |memory, done| {
+                            match handle {
                                 Some(handle) => {
-                                    done.unmapped = logged(
+                                    done.record(
                                         "211",
                                         memory.normal_map_4k(range.0, range.1, handle, offset),
                                     );
                                 }
                                 None => tracing::warn!("nx2:gpu 211: memory handle 0"),
-                            },
-                        );
+                            }
+                        });
                         ResultCode::SUCCESS
                     }
                     212 => {
                         let wanted = (words.u32(7) & 0xff) as u8;
-                        self.in_order(Some(words.u32(10)), false, Some(range), move |memory, _| {
-                            if let Err(err) = memory.modify_kind(range.0, range.1, wanted) {
-                                tracing::warn!("nx2:gpu 212: {err}");
-                            }
-                        });
+                        self.in_order(
+                            Some(words.u32(10)),
+                            false,
+                            Some(range),
+                            move |memory, done| {
+                                if let Err(err) = memory.modify_kind(range.0, range.1, wanted) {
+                                    done.error("212", err);
+                                }
+                            },
+                        );
                         ctx.push(u32::from(wanted));
                         ResultCode::SUCCESS
                     }
@@ -535,7 +613,7 @@ impl Service for GpuSession {
                             true,
                             Some((first, last)),
                             move |memory, done| {
-                                done.unmapped = logged("213", memory.unmap_4k(first, last));
+                                done.record("213", memory.unmap_4k(first, last));
                             },
                         );
                         ResultCode::SUCCESS
@@ -546,8 +624,7 @@ impl Service for GpuSession {
                         let slot = words.u32(11);
                         if words.u32(7) & SPARSE_REGION != 0 {
                             self.in_order(Some(slot), false, Some(range), move |memory, done| {
-                                done.unmapped =
-                                    logged("214", memory.create_sparse_region(first, size));
+                                done.record("214", memory.create_sparse_region(first, size));
                             });
                         } else {
                             self.create_gpu_only(first, size, slot);
@@ -577,7 +654,7 @@ impl Service for GpuSession {
                                     }
                                     Err(err) => Err(err),
                                 };
-                                done.unmapped.extend(logged("215", result));
+                                done.record("215", result);
                             },
                         );
                         ResultCode::SUCCESS

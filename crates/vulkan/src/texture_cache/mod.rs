@@ -2075,6 +2075,54 @@ impl TextureCache {
         result
     }
 
+    pub(crate) fn flush_nvn2(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        daddr: DAddr,
+        size: u64,
+        buffer_writes: bool,
+    ) -> Result<(), lichii_gpu::backend::ReplayError> {
+        use lichii_gpu::backend::ReplayError;
+
+        self.collect_overlaps(&[Segment {
+            offset: 0,
+            daddr,
+            size,
+        }]);
+        let mut modified = std::mem::take(&mut self.ids);
+        modified.retain(|&id| self.image(id).gpu_modified);
+        let result =
+            match modified.as_slice() {
+                [] => Ok(()),
+                &[id] if !buffer_writes => {
+                    let image = self.image(id);
+                    if !image.downloadable()
+                        || image.host.conversion != Conversion::None
+                        || convert::depth_planes(image.host.format).is_some()
+                        || !image.aliases.is_empty()
+                        || !image.overlaps.is_empty()
+                        || !image.keep_out.is_empty()
+                        || !matches!(image.segments.as_slice(), [seg] if
+                        seg.offset == 0 && seg.size == image.info.size_bytes() &&
+                        seg.daddr >= daddr && seg.daddr + seg.size <= daddr + size)
+                    {
+                        Err(ReplayError)
+                    } else {
+                        self.download(tx, &modified, None).map_err(|error| {
+                        tracing::error!(%error, "writing back the native NVN2 image failed");
+                        ReplayError
+                    }).and_then(|()| {
+                        if self.image(id).gpu_modified { Err(ReplayError) } else { Ok(()) }
+                    })
+                    }
+                }
+                _ => Err(ReplayError),
+            };
+        modified.clear();
+        self.ids = modified;
+        result
+    }
+
     /// Device memory `[daddr, daddr + size)` was unmapped: drop the images in it.
     pub fn unmap(&mut self, scheduler: &mut Scheduler, daddr: DAddr, size: u64) {
         self.collect_overlaps(&[Segment {

@@ -27,6 +27,11 @@ use crate::semaphore_mirror::{REGION_SIZE, SemaphoreMirror};
 
 const DEVICE_ALIGN: u64 = 0x2_0000;
 
+mod nvn2;
+pub use nvn2::{
+    Nvn2BackingOwner, Nvn2Mutation, Nvn2Retirement, Nvn2RetirementAdmission, Nvn2TargetLease,
+};
+
 /// A GpuMemoryHandle as nn::gpu::sdk stores it (reply word 3 of gpu sub 101).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GpuMemoryHandle(NonZeroU32);
@@ -86,6 +91,8 @@ pub enum Nx2MemoryError {
     OutOfHandles,
     #[error("GPU range {va:#x}+{size:#x} is already in use")]
     RangeInUse { va: GpuVAddr, size: u64 },
+    #[error("GPU range {va:#x}+{size:#x} is owned by NVN2")]
+    Nvn2TargetInUse { va: GpuVAddr, size: u64 },
     #[error("no sparse region at {va:#x}+{size:#x}")]
     NoSuchRegion { va: GpuVAddr, size: u64 },
     #[error("GPU range {va:#x}+{size:#x} is not mapped")]
@@ -113,6 +120,8 @@ struct State {
     regions: BTreeMap<GpuVAddr, Region>,
     ranges: BTreeMap<GpuVAddr, Range>,
     spaces: Vec<(AddressSpaceId, Arc<Gmmu>)>,
+    nvn2: Option<nvn2::Registration>,
+    nvn2_space: Option<AddressSpaceId>,
 }
 
 /// A sparse or lazy region (gpu sub 214).
@@ -174,17 +183,27 @@ impl Nx2GpuMemory {
         let mut state = self.state.lock();
         state.last_space += 1;
         let id = AddressSpaceId(state.last_space);
+        if state.nvn2_space.is_some() {
+            return id;
+        }
+        self.register_locked(&mut state, id, gmmu);
+        id
+    }
+
+    fn register_locked(&self, state: &mut State, id: AddressSpaceId, gmmu: Arc<Gmmu>) {
         gmmu.set_lazy(self.lazy.clone());
         for (&start, range) in &state.ranges {
             apply(&state.memories, &gmmu, start, range);
         }
         state.spaces.push((id, gmmu));
-        id
     }
 
     /// Stops sending mappings to a GMMU; it keeps what it has.
     pub fn unregister_address_space(&self, id: AddressSpaceId) -> Option<Arc<Gmmu>> {
         let mut state = self.state.lock();
+        if state.nvn2_space == Some(id) {
+            return None;
+        }
         let index = state.spaces.iter().position(|(space, _)| *space == id)?;
         Some(state.spaces.remove(index).1)
     }
@@ -231,6 +250,7 @@ impl Nx2GpuMemory {
         }
         let handle = handle.raw();
         let mut state = self.state.lock();
+        state.guard_nvn2(Some(handle), cpu_va, size)?;
         let daddr = self
             .allocator
             .allocate(size, DEVICE_ALIGN)
@@ -240,6 +260,15 @@ impl Nx2GpuMemory {
                 .free(daddr, size)
                 .expect("the range was just allocated");
             return Err(Nx2MemoryError::SourceUnmapped { va: fault.addr });
+        }
+        if let Some(target) = state.nvn2.as_ref().map(nvn2::Registration::target)
+            && target.aliases(&self.device, daddr, size)
+        {
+            self.device.unmap(daddr, size);
+            self.allocator
+                .free(daddr, size)
+                .expect("the range was just allocated");
+            return Err(target.busy());
         }
         state.memories.insert(
             handle,
@@ -273,8 +302,27 @@ impl Nx2GpuMemory {
     /// mapped and in every address space (parts of sparse regions read zero again), then frees
     /// its device range. Returns the mappings removed.
     pub fn destroy(&self, handle: GpuMemoryHandle) -> Result<Vec<Unmapped>, Nx2MemoryError> {
-        let raw = handle.raw();
         let mut state = self.state.lock();
+        let release = match &state.nvn2 {
+            Some(nvn2::Registration::Mapped(target)) if target.handle == handle => {
+                return Err(target.busy());
+            }
+            Some(nvn2::Registration::Remapped(target)) => target.handle == handle,
+            _ => false,
+        };
+        let unmapped = self.destroy_locked(&mut state, handle)?;
+        let owner = if release { state.nvn2.take() } else { None };
+        drop(state);
+        drop(owner);
+        Ok(unmapped)
+    }
+
+    fn destroy_locked(
+        &self,
+        state: &mut State,
+        handle: GpuMemoryHandle,
+    ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
+        let raw = handle.raw();
         let memory = state
             .memories
             .remove(&raw)
@@ -310,8 +358,19 @@ impl Nx2GpuMemory {
         offset: u64,
     ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
         let size = inclusive_size(first_va, last_va)?;
-        let raw = handle.raw();
         let mut state = self.state.lock();
+        state.guard_nvn2(Some(handle.raw()), first_va, size)?;
+        Self::map_locked(&mut state, first_va, size, handle, offset)
+    }
+
+    fn map_locked(
+        state: &mut State,
+        first_va: GpuVAddr,
+        size: u64,
+        handle: GpuMemoryHandle,
+        offset: u64,
+    ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
+        let raw = handle.raw();
         let memory = state
             .memories
             .get(&raw)
@@ -345,7 +404,9 @@ impl Nx2GpuMemory {
         last_va: GpuVAddr,
     ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
         let size = inclusive_size(first_va, last_va)?;
-        Ok(self.state.lock().unmap(first_va, size))
+        let mut state = self.state.lock();
+        state.guard_nvn2(None, first_va, size)?;
+        Ok(state.unmap(first_va, size))
     }
 
     /// CreateSparseRegion (gpu sub 214): reserves [`va`, +`size`) in every address space. It reads
@@ -357,6 +418,7 @@ impl Nx2GpuMemory {
     ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
         check_range(va, size)?;
         let mut state = self.state.lock();
+        state.guard_nvn2(None, va, size)?;
         if state.in_use(va, size) {
             return Err(Nx2MemoryError::RangeInUse { va, size });
         }
@@ -379,6 +441,7 @@ impl Nx2GpuMemory {
         size: u64,
     ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
         let mut state = self.state.lock();
+        state.guard_nvn2(None, va, size)?;
         if !state
             .regions
             .get(&va)
@@ -402,6 +465,7 @@ impl Nx2GpuMemory {
     ) -> Result<(DAddr, Vec<Unmapped>), Nx2MemoryError> {
         check_range(va, size)?;
         let mut state = self.state.lock();
+        state.guard_nvn2(None, va, size)?;
         if state.in_use(va, size) {
             return Err(Nx2MemoryError::RangeInUse { va, size });
         }
@@ -437,6 +501,7 @@ impl Nx2GpuMemory {
         size: u64,
     ) -> Result<LazyRegionDestroyed, Nx2MemoryError> {
         let mut state = self.state.lock();
+        state.guard_nvn2(None, va, size)?;
         let Some(daddr) = state
             .regions
             .get(&va)
@@ -469,6 +534,7 @@ impl Nx2GpuMemory {
         let size = inclusive_size(first_va, last_va)?;
         let end = first_va + size;
         let mut state = self.state.lock();
+        state.guard_nvn2(None, first_va, size)?;
         let mut at = first_va;
         for (&start, range) in state.ranges.range(..end) {
             if start + range.size <= at {

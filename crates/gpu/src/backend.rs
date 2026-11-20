@@ -701,6 +701,12 @@ pub trait Rasterizer: Send {
         Ok(ReplayAdmission::UseStandard)
     }
 
+    /// Writes back and invalidates a still-mapped native replay target after host completion.
+    /// Success authorizes the caller to unmap and recycle its backing.
+    fn finish_nvn2_backing(&mut self, _addr: DAddr, _size: u64) -> Result<(), ReplayError> {
+        Err(ReplayError)
+    }
+
     /// Whether acquires should be routed through this renderer's ordered fence queue. The
     /// default keeps the front's existing guest-memory acquire path.
     fn ordered_semaphore_acquires(&self) -> bool {

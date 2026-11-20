@@ -105,7 +105,7 @@ fn check(threading: Threading, mode: Result<ReplayAdmission, ReplayError>) {
         channel,
         Nvn2Work {
             packet,
-            standard: Box::new(move |r| {
+            standard: Some(Box::new(move |r| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 let mut regs = Box::new(Regs::zeroed());
                 regs.rt[0].address_low = TARGET as u32;
@@ -121,7 +121,9 @@ fn check(threading: Threading, mode: Result<ReplayAdmission, ReplayError>) {
                     },
                     1,
                 );
-            }),
+                Ok(())
+            })),
+            lease: None,
             done,
         },
     );

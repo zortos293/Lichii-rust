@@ -339,6 +339,40 @@ fn direct_and_standard_clear_the_same_pixels_in_queue_order() {
 }
 
 #[test]
+fn native_backing_acknowledges_only_a_complete_writeback_and_invalidation() {
+    let Some((mut f, memory, found)) = scene(GobLayout::Switch2) else {
+        return;
+    };
+    let r = &mut f.rasterizer;
+    authorize(r, &memory, found);
+    assert_eq!(
+        r.try_replay_nvn2(&packet(&memory, GREEN, release(1))),
+        Ok(ReplayAdmission::Recorded)
+    );
+    r.release_fences(true);
+    assert!(!r.has_pending_fences());
+    assert_eq!(f.memory.read::<u32>(SEMAPHORE + 4).unwrap(), 1);
+    assert_eq!(f.memory.read::<[u8; 4]>(DADDR).unwrap(), [0; 4]);
+
+    let tiling = Tiling::new(64, 32, 1, 4, 2, 0, GobLayout::Switch2);
+    let size = tiling.size_bytes() as u64;
+    assert_eq!(r.finish_nvn2_backing(DADDR, size / 2), Err(ReplayError));
+    assert!(r.texture_cache.state(found.id).is_some());
+    assert_eq!(f.memory.read::<[u8; 4]>(DADDR).unwrap(), [0; 4]);
+
+    assert_eq!(r.finish_nvn2_backing(DADDR, size), Ok(()));
+    assert!(r.texture_cache.state(found.id).is_none());
+    assert!(
+        guest_linear(&f, DADDR, &tiling)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [0, 255, 0, 255])
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn rejected_submissions_enter_standard_before_recording_or_enqueuing_a_fence() {
     const REMAPPED: DAddr = DADDR + 0x40_0000;
     let layout = GobLayout::Switch2;

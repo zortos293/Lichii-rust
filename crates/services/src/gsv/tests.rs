@@ -14,11 +14,18 @@ use lichii_memory::MemoryPermission;
 use crate::ServiceContext;
 use crate::testing::{SWITCH2_TITLE, context};
 
+mod nvn2;
+
 const CURRENT_PROCESS: Handle = 0xffff_8001;
 
 fn gsv() -> (Arc<ServiceContext>, IpcClient, Handle) {
     let (context, client) = context(SWITCH2_TITLE, Settings::default());
-    crate::am::register(&context).unwrap();
+    let gsv = connect_gsv(&context, &client);
+    (context, client, gsv)
+}
+
+fn connect_gsv(context: &Arc<ServiceContext>, client: &IpcClient) -> Handle {
+    crate::am::register(context).unwrap();
     let service = client.connect("appletOE").unwrap();
     let open = Request::new(0)
         .send_pid()
@@ -28,7 +35,7 @@ fn gsv() -> (Arc<ServiceContext>, IpcClient, Handle) {
     let self_controller = client.send(proxy, &Request::new(1)).unwrap().move_handles[0];
     let reply = client.send(self_controller, &Request::new(2000)).unwrap();
     assert_eq!(reply.result, ResultCode::SUCCESS);
-    (context, client, reply.copy_handles[0])
+    reply.copy_handles[0]
 }
 
 fn session(client: &IpcClient, gsv: Handle, command: u32) -> Handle {
@@ -934,6 +941,55 @@ fn an_unmap_waits_for_the_gpu_work_queued_before_it() {
     );
     assert!(gmmu.read::<u32>(heap).is_err());
     assert!(slot.is_signaled());
+}
+
+#[test]
+fn native_gpu_destroy_and_heap_resize_currently_do_not_hold_backing() {
+    use lichii_gpu::nx2_memory::GpuMemoryHandle;
+
+    const HEAP: u64 = 2 << 20;
+    const SIZE: u64 = 0x1000;
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let process = client.process();
+    let heap = process.page_table().set_heap_size(HEAP).unwrap();
+    let create = |at| {
+        words(
+            Request::tipc(101),
+            &[split(at), split(at + SIZE - 1), [0, 0]].concat(),
+        )
+    };
+    let old = GpuMemoryHandle::new(client.send(gpu, &create(heap)).unwrap().pop::<u32>()).unwrap();
+    let registry = context.gpu.nx2_memory().unwrap();
+    let device = &context.gpu.host1x().memory;
+    let daddr = registry.memory_info(old).unwrap().daddr;
+    let paddr = device.physical_address(daddr).unwrap();
+    assert_eq!(process.memory().physical_address(heap), Some(paddr));
+    assert_eq!(gmmu.translate(heap), Some(daddr));
+
+    let manager = process.page_table().memory_manager();
+    let pool = process.page_table().pool();
+    let before = manager.free_size(pool);
+    process.page_table().set_heap_size(0).unwrap();
+    assert_eq!(manager.free_size(pool), before + HEAP);
+    assert_eq!(device.physical_address(daddr), Some(paddr));
+    assert_eq!(gmmu.translate(heap), Some(daddr));
+    process.page_table().set_heap_size(HEAP).unwrap();
+    assert_eq!(process.memory().physical_address(heap), Some(paddr));
+    process.memory().write(heap, 0xdecafbad_u32).unwrap();
+    assert_eq!(gmmu.read::<u32>(heap), Ok(0xdecafbad));
+
+    let removed = registry.destroy(old).unwrap();
+    assert!(removed.iter().any(|range| range.range.daddr == daddr));
+    assert_eq!(device.physical_address(daddr), None);
+    assert_eq!(gmmu.translate(heap), None);
+    let new =
+        GpuMemoryHandle::new(client.send(gpu, &create(heap + SIZE)).unwrap().pop::<u32>()).unwrap();
+    assert_eq!(registry.memory_info(new).unwrap().daddr, daddr);
+    assert_ne!(device.physical_address(daddr), Some(paddr));
 }
 
 #[test]
