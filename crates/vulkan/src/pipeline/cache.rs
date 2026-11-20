@@ -432,6 +432,29 @@ enum Build {
     },
 }
 
+/// Names the programs of a pipeline the driver refused, and writes their SPIR-V to
+/// `LICHII_FAILED_PIPELINE_DIR` (as `<stage>-<hash>.spv`) when it is set, so the shader that
+/// breaks the driver can be found and validated outside the title.
+fn failed_pipeline<'a>(kind: &str, programs: impl Iterator<Item = &'a ShaderModule> + Clone) {
+    let names: Vec<String> = programs.clone().map(|m| Program(m).to_string()).collect();
+    tracing::error!(
+        "the driver refused the {kind} pipeline of {}",
+        names.join(" ")
+    );
+    let Some(dir) = std::env::var_os("LICHII_FAILED_PIPELINE_DIR").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    for (module, name) in programs.zip(&names) {
+        let bytes: Vec<u8> = module.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let path = dir.join(format!("{}.spv", name.replace(' ', "-")));
+        if let Err(error) = std::fs::write(&path, bytes) {
+            tracing::warn!("writing {}: {error}", path.display());
+        }
+    }
+}
+
 impl Context {
     fn build(&self, build: Build) -> Option<Pipeline> {
         let library = matches!(&build, Build::Graphics { part, .. } if part.is_library());
@@ -443,14 +466,16 @@ impl Context {
                 part,
             } => {
                 let result = self.build_graphics(&key, &programs, &layout, part);
-                if let Ok((raw, _)) = result {
-                    let kind = if library {
-                        "graphics library"
-                    } else {
-                        "graphics"
-                    };
-                    self.device
-                        .name(raw, format_args!("{kind} {}", Programs(&programs)));
+                let kind = if library {
+                    "graphics library"
+                } else {
+                    "graphics"
+                };
+                match &result {
+                    Ok((raw, _)) => self
+                        .device
+                        .name(*raw, format_args!("{kind} {}", Programs(&programs))),
+                    Err(_) => failed_pipeline(kind, programs.iter().flatten().map(|m| &**m)),
                 }
                 (result, layout)
             }
@@ -460,9 +485,11 @@ impl Context {
                 layout,
             } => {
                 let result = self.build_compute(&key, &program, &layout);
-                if let Ok((raw, _)) = result {
-                    self.device
-                        .name(raw, format_args!("compute {}", Program(&program)));
+                match &result {
+                    Ok((raw, _)) => self
+                        .device
+                        .name(*raw, format_args!("compute {}", Program(&program))),
+                    Err(_) => failed_pipeline("compute", std::iter::once(&*program)),
                 }
                 (result, layout)
             }

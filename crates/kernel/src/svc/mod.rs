@@ -152,11 +152,18 @@ impl SvcContext<'_> {
 }
 
 pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
+    let (entry, pc) = (
+        [svc.ctx.x[0], svc.ctx.x[1], svc.ctx.x[2], svc.ctx.x[3]],
+        svc.ctx.pc,
+    );
     if !svc.kernel.svc_trace {
-        return call(svc, imm);
+        let flow = call(svc, imm);
+        record_svc(svc, imm, entry, pc);
+        return flow;
     }
     let args: [u64; 8] = svc.ctx.x[..8].try_into().unwrap();
     let flow = call(svc, imm);
+    record_svc(svc, imm, entry, pc);
     tracing::info!(
         target: "svc",
         thread = svc.thread.id(),
@@ -166,6 +173,16 @@ pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
         blocked = flow == Flow::Switch,
     );
     flow
+}
+
+/// Puts the call in the thread's flight recorder (see [`crate::flight`]).
+fn record_svc(svc: &SvcContext, imm: u32, args: [u64; 4], pc: u64) {
+    svc.thread.recorder.lock().push(crate::flight::Event::Svc {
+        imm,
+        args,
+        out: [svc.ctx.x[0], svc.ctx.x[1]],
+        pc,
+    });
 }
 
 /// Registers in a `debug.svc_trace` line: bare hex words between brackets, so each call stays

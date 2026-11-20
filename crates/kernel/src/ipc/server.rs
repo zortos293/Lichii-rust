@@ -245,11 +245,11 @@ impl ServiceThread {
                     ResultCode::SUCCESS
                 }
                 Some((DomainCommand::SendMessage, id)) => match server.object(id) {
-                    Some(handler) => handler.handle_request(ctx),
+                    Some(handler) => recorded(ctx, &*handler),
                     None => result::NOT_FOUND,
                 },
                 None => match server.handler() {
-                    Some(handler) => handler.handle_request(ctx),
+                    Some(handler) => recorded(ctx, &*handler),
                     None => result::SESSION_CLOSED,
                 },
             },
@@ -259,6 +259,16 @@ impl ServiceThread {
         };
         reply(ctx, &server, &pending, code)
     }
+}
+
+/// Has `handler` answer the request and puts it in the calling thread's flight recorder.
+fn recorded(ctx: &mut HleRequestContext, handler: &dyn SessionHandler) -> ResultCode {
+    let code = handler.handle_request(ctx);
+    if let Some(thread) = &ctx.thread {
+        let event = crate::flight::Event::ipc(handler.name(), ctx.command(), code.0);
+        thread.recorder.lock().push(event);
+    }
+    code
 }
 
 fn clear_outputs(ctx: &mut HleRequestContext) {

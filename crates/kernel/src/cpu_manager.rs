@@ -7,10 +7,96 @@ use std::sync::atomic::Ordering;
 use lichii_cpu::{CpuCore, HaltReason, ThreadContext};
 
 use crate::KernelInner;
-use crate::process::ProcessId;
+use crate::process::{Process, ProcessId};
 use crate::scheduler::Preempt;
 use crate::svc::{self, Flow, SvcContext};
 use crate::thread::Thread;
+
+/// Logs what is needed to find why a guest thread crashed, for any title: its registers, the
+/// module and offset of the PC and LR, the instruction words around the PC and the return
+/// addresses of the frame-pointer chain.
+fn report_guest_crash(process: &Process, ctx: &ThreadContext) {
+    use std::fmt::Write;
+    let memory = process.memory();
+    let mut registers = String::new();
+    for (i, x) in ctx.x.iter().enumerate() {
+        let _ = write!(registers, " x{i}={x:#x}");
+    }
+    tracing::error!(
+        "guest crash registers:{registers} sp={:#x} pc={:#x} nzcv={:#x} tpidr={:#x}",
+        ctx.sp,
+        ctx.pc,
+        ctx.pstate >> 28,
+        ctx.tpidr_el0
+    );
+    let mut code = String::new();
+    for i in -6i64..=3 {
+        let at = ctx.pc.wrapping_add_signed(i * 4);
+        match memory.read::<u32>(at) {
+            Ok(word) if i == 0 => {
+                let _ = write!(code, " [{word:08x}]");
+            }
+            Ok(word) => {
+                let _ = write!(code, " {word:08x}");
+            }
+            Err(_) => code.push_str(" ????????"),
+        }
+    }
+    tracing::error!(
+        "guest crash at {} (lr {}), code from pc-24:{code}",
+        process.locate(ctx.pc),
+        process.locate(ctx.x[30])
+    );
+    let mut frames = String::new();
+    let mut fp = ctx.x[29];
+    for _ in 0..32 {
+        if fp == 0 || !fp.is_multiple_of(8) {
+            break;
+        }
+        let (Ok(next), Ok(lr)) = (memory.read::<u64>(fp), memory.read::<u64>(fp + 8)) else {
+            break;
+        };
+        let _ = write!(frames, " {}", process.locate(lr));
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    tracing::error!("guest crash backtrace:{frames}");
+    for i in -40i64..=3 {
+        let at = ctx.pc.wrapping_add_signed(i * 4);
+        if let Ok(word) = memory.read::<u32>(at) {
+            let mark = if i == 0 { ">" } else { " " };
+            let inst = lichii_cpu::decoder::decode(word);
+            tracing::error!(
+                "guest crash code{mark}{} {word:08x} {inst:?}",
+                process.locate(at)
+            );
+        }
+    }
+    for (i, &value) in ctx.x.iter().enumerate().take(29) {
+        let base = (value & !7).wrapping_sub(0x20);
+        let mut words = String::new();
+        for k in 0..12u64 {
+            match memory.read::<u64>(base + k * 8) {
+                Ok(word) => {
+                    let _ = write!(words, " {word:x}");
+                }
+                Err(_) => break,
+            }
+        }
+        if !words.is_empty() && !process.locate(value).contains('+') {
+            tracing::error!("guest crash memory x{i} from {base:#x}:{words}");
+        }
+    }
+}
+
+/// Logs the crashed thread's latest supervisor calls and service requests.
+fn report_flight(thread: &Thread) {
+    for line in thread.recorder.lock().lines() {
+        tracing::error!("guest crash before ({}): {line}", thread.id());
+    }
+}
 
 struct Core {
     kernel: Arc<KernelInner>,
@@ -134,6 +220,7 @@ impl Core {
                         pc = format_args!("{:#x}", self.ctx.pc),
                         "guest BRK #{imm:#x}"
                     );
+                    report_guest_crash(thread.process(), &self.ctx);
                     self.kernel.terminate_process(thread.process());
                     Flow::ExitThread
                 }
@@ -144,6 +231,8 @@ impl Core {
                         lr = format_args!("{:#x}", self.ctx.x[30]),
                         "unhandled guest fault: {fault:?}"
                     );
+                    report_guest_crash(thread.process(), &self.ctx);
+                    report_flight(thread);
                     self.kernel.terminate_process(thread.process());
                     Flow::ExitThread
                 }

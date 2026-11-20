@@ -10,6 +10,7 @@ mod alarm;
 pub mod arbiter;
 mod cpu_manager;
 pub mod event;
+mod flight;
 pub mod handle_table;
 pub mod ipc;
 mod live_pc;
