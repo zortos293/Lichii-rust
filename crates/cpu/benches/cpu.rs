@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lichii_common::settings::{CpuAccuracy, CpuBackend};
-use lichii_cpu::{CpuConfig, GuestClock, HaltReason, ThreadContext, TscScale, new_core};
+use lichii_cpu::{
+    CpuConfig, CpuCore, GuestClock, HaltReason, Interpreter, ThreadContext, TscScale,
+};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
 const CODE: u64 = 0x10000;
@@ -709,6 +711,10 @@ fn main() {
         .filter(|a| !a.starts_with('-'))
         .collect();
     let jit_only = std::env::var_os("LICHII_BENCH_JIT_ONLY").is_some();
+    assert!(
+        !jit_only || cfg!(target_arch = "x86_64"),
+        "JIT benchmarks require x86-64"
+    );
     let software_memory = std::env::var_os("LICHII_BENCH_SOFTWARE_MEMORY").is_some();
     for ((workload, fpcr), backend) in WORKLOADS
         .iter()
@@ -718,7 +724,10 @@ fn main() {
             std::iter::once((w, 0)).chain(fz)
         })
         .flat_map(|w| [(w, CpuBackend::Interpreter), (w, CpuBackend::Jit)])
-        .filter(|(_, backend)| !jit_only || *backend == CpuBackend::Jit)
+        .filter(|(_, backend)| match backend {
+            CpuBackend::Interpreter => !jit_only,
+            CpuBackend::Jit => cfg!(target_arch = "x86_64"),
+        })
     {
         let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
         let mem = Arc::new(if software_memory {
@@ -734,21 +743,27 @@ fn main() {
                 mem.write(base + 4 * i as u64, *word).unwrap();
             }
         }
-        let mut core = new_core(
-            backend,
-            CpuConfig {
-                memory: mem,
-                monitor: Arc::new(ExclusiveMonitor::new(1)),
-                clock: Arc::new(Clock {
-                    start: Instant::now(),
-                    scale: TscScale::new(1 << 31, 32, 0),
-                }),
-                core_index: 0,
-                ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
-                dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
-                accuracy: CpuAccuracy::Auto,
-            },
-        );
+        let config = CpuConfig {
+            memory: mem,
+            monitor: Arc::new(ExclusiveMonitor::new(1)),
+            clock: Arc::new(Clock {
+                start: Instant::now(),
+                scale: TscScale::new(1 << 31, 32, 0),
+            }),
+            core_index: 0,
+            ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+            dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            accuracy: CpuAccuracy::Auto,
+        };
+        let mut core: Box<dyn CpuCore> = match backend {
+            CpuBackend::Interpreter => Box::new(Interpreter::new(config)),
+            #[cfg(target_arch = "x86_64")]
+            CpuBackend::Jit => {
+                Box::new(lichii_cpu::Jit::new(config).expect("could not create JIT core"))
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            CpuBackend::Jit => unreachable!(),
+        };
         let mut wall_times = [Duration::ZERO; 5];
         let mut cpu_times = [None; 5];
         for run in 0..=wall_times.len() {
