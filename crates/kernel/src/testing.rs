@@ -131,6 +131,7 @@ pub fn program_image(program_id: u64) -> ProgramImage {
         pseudo_device_seed: program_id,
         add_ons: Vec::new(),
         present_interval: None,
+        frame_mode_word: None,
     }
 }
 

@@ -256,6 +256,9 @@ impl ConfigWindow {
                             "Dynamic FPS: full game speed when frames run slow",
                         )
                     });
+                    row(ui, "Mario Kart World frame mode", |ui| {
+                        combo(ui, "mkw frame mode", &mut d.system.mkw_frame_mode)
+                    });
                 });
                 note(
                     ui,

@@ -5,6 +5,7 @@ use lichii_fs::FileRef;
 use lichii_fs::nacp::Nacp;
 
 use crate::npdm::{AddressSpaceType, KernelCapabilities, Npdm, PoolPartition, ServiceAccess};
+use crate::patch::AppliedPatches;
 
 /// Memory permission of a code segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,22 +181,29 @@ pub struct ProgramImage {
     /// The swap interval a patch made the title's presents follow, overriding the one each
     /// present names: 1 under Mario Kart World's dynamic FPS mode.
     pub present_interval: Option<u32>,
+    /// Offset from the code region base of the word Mario Kart World's frame mode load reads
+    /// (1 for 60 FPS, 2 for 30 FPS), which the emulator writes to switch modes.
+    pub frame_mode_word: Option<u64>,
 }
 
 impl ProgramImage {
-    /// `present_interval` is what [`crate::Mods::patch_modules`] returned for `modules`.
+    /// `patches` is what [`crate::Mods::patch_modules`] returned for `modules`.
     pub(crate) fn new(
         npdm: Npdm,
         mut modules: Vec<Module>,
         romfs: Option<FileRef>,
         nacp: Option<Nacp>,
-        present_interval: Option<u32>,
+        patches: AppliedPatches,
     ) -> Self {
         let mut offset = 0;
         for module in &mut modules {
             module.offset = offset;
             offset += module.size;
         }
+        let frame_mode_word = patches.frame_mode_word.and_then(|word| {
+            let main = modules.iter().find(|m| m.name == "main")?;
+            Some(main.offset + word)
+        });
         let pseudo_device_seed = nacp
             .as_ref()
             .map_or(npdm.program_id, Nacp::seed_for_pseudo_device_id);
@@ -225,7 +233,8 @@ impl ProgramImage {
             version: 0,
             pseudo_device_seed,
             add_ons: Vec::new(),
-            present_interval,
+            present_interval: patches.present_interval,
+            frame_mode_word,
         }
     }
 

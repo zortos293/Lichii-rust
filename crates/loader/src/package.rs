@@ -110,10 +110,10 @@ pub(crate) fn load(
     let mods = Mods::find(&options.mods, selected.program_id)?;
     let exefs = mods.layer_exefs(Arc::new(selected.exefs()?))?;
     let (npdm, mut modules) = load_exefs(exefs.as_ref(), options.hashes)?;
-    let present_interval = mods.patch_modules(&mut modules)?;
+    let patches = mods.patch_modules(&mut modules)?;
     let romfs = mods.layer_romfs(selected.romfs()?)?;
     let control = selected.control(options.language);
-    let mut image = ProgramImage::new(npdm, modules, romfs, control.nacp, present_interval);
+    let mut image = ProgramImage::new(npdm, modules, romfs, control.nacp, patches);
     image.icon = control.icon;
     image.version = selected.version;
     image.add_ons = add_ons(&contents.index, selected.application_id);

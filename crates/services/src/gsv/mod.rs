@@ -7,6 +7,7 @@
 //! Commands nobody has decoded fall to the `nx2:` auto-stub (success and zeroed data), which is
 //! what the console's server answers for the feature queries titles make at boot.
 
+mod frame_mode;
 mod gpu;
 mod native;
 mod reserve;

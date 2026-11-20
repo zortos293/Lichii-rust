@@ -124,6 +124,7 @@ impl System {
             mods: ModOptions {
                 builtin_patches: settings.system.builtin_game_patches,
                 mkw_dynamic_fps: settings.system.mkw_dynamic_fps,
+                mkw_frame_mode: settings.system.mkw_frame_mode,
                 ..ModOptions::default()
             },
             ..LoadOptions::default()

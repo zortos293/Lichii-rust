@@ -285,6 +285,21 @@ pub struct SystemSettings {
     /// one or two 1/60 s steps a frame to keep real speed at any frame rate, instead of playing a
     /// slow frame in slow motion. Off by default, as there.
     pub mkw_dynamic_fps: bool,
+    /// Mario Kart World's frame mode, as the C++ Lichii's `mkw_60fps_fallback`. Off leaves the
+    /// game's own choice.
+    pub mkw_frame_mode: MkwFrameMode,
+}
+
+/// Which of Mario Kart World's two frame modes the title runs in: one 1/60 s game step per
+/// frame (60 FPS) or one 1/30 s step per frame, which keeps full speed at half the frame rate.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MkwFrameMode {
+    #[default]
+    Off,
+    /// 60 FPS while frames keep up, 30 FPS at full speed while they don't.
+    Auto,
+    Sixty,
+    Thirty,
 }
 
 /// The [`SystemSettings::time_zone`] value that follows the host's time zone.
@@ -306,6 +321,7 @@ impl Default for SystemSettings {
             exit_timeout_ms: 2000,
             builtin_game_patches: true,
             mkw_dynamic_fps: false,
+            mkw_frame_mode: MkwFrameMode::Off,
         }
     }
 }

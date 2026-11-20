@@ -14,10 +14,12 @@ use lichii_gpu::gmmu::{BigPageSize, Gmmu};
 use lichii_gpu::host1x::SyncpointWaitError;
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
+use lichii_loader::FRAME_MODE_SIXTY;
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 use parking_lot::Mutex;
 
+use super::frame_mode::FrameMode;
 use super::native::{FORMAT_RGB10A2, FORMAT_RGBA16_FLOAT, NativeObjects, bytes_per_pixel};
 use super::{UNKNOWN, Words, handshake, push_readable};
 use crate::{Service, ServiceContext};
@@ -133,6 +135,8 @@ struct Presents {
     /// When the next frame is due, while the title is paced.
     deadline: Option<Instant>,
     timeouts: u32,
+    /// Mario Kart World's adaptive frame mode, once its first present started it.
+    frame_mode: Option<FrameMode>,
 }
 
 /// Present word 12: the swap interval in its high half, the refresh rate in its low half.
@@ -262,6 +266,7 @@ impl Vi2 {
                 tracing::warn!("nx2:vi2 229: previous frame's fence ({id}, {value:#x}): {err}");
             }
         }
+        self.switch_frame_mode(&mut presents);
         self.composite(image, drawn, fence);
         self.context
             .perf
@@ -270,6 +275,30 @@ impl Vi2 {
         pace(&mut presents, interval);
         ctx.push([AVAILABLE_SLOTS, 0, 0]);
         ResultCode::SUCCESS
+    }
+
+    /// Lets Mario Kart World's adaptive frame mode follow this present's timing and writes the
+    /// mode word the title's patched mode load reads when the mode changes.
+    fn switch_frame_mode(&self, presents: &mut Presents) {
+        let Some(word) = self.context.program.frame_mode_word else {
+            return;
+        };
+        let now = Instant::now();
+        let mode = presents
+            .frame_mode
+            .get_or_insert_with(|| FrameMode::new(now));
+        let Some(next) = mode.present(now) else {
+            return;
+        };
+        let process = &self.context.process;
+        let address = process.code_region().start + word;
+        match process.memory().write(address, next) {
+            Ok(()) => tracing::info!(
+                "nx2:vi2 229: Mario Kart World runs {} FPS game steps",
+                if next == FRAME_MODE_SIXTY { 60 } else { 30 }
+            ),
+            Err(err) => tracing::warn!("nx2:vi2 229: frame mode word at {address:#x}: {err}"),
+        }
     }
 
     /// Presents native image `handle` once `fence`, this frame's, is reached: the frame's GPU

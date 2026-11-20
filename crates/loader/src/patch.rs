@@ -12,6 +12,8 @@ use lichii_fs::ips::{IpSwitch, Ips, parse_build_id};
 use lichii_fs::romfs::{RomfsExt, build_romfs, open_romfs};
 use lichii_fs::{DirRef, Directory, DirectoryExt, EntryKind, FileExt, FileRef, LayeredDir};
 
+use lichii_common::settings::MkwFrameMode;
+
 use crate::error::LoaderResult;
 use crate::program::Module;
 use crate::{builtin, mkw};
@@ -31,6 +33,18 @@ pub struct ModOptions {
     pub builtin_patches: bool,
     /// Put Mario Kart World in its dynamic FPS mode ([`crate::mkw`]; off by default).
     pub mkw_dynamic_fps: bool,
+    /// Pin Mario Kart World's frame mode, or let it switch at run time ([`crate::mkw`]; off by
+    /// default). The dynamic FPS mode takes precedence.
+    pub mkw_frame_mode: MkwFrameMode,
+}
+
+/// What [`Mods::patch_modules`] did that the running title has to know about.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AppliedPatches {
+    /// The swap interval the title's presents follow, overriding the one each present names.
+    pub present_interval: Option<u32>,
+    /// Byte offset in `main` of the frame mode word the emulator switches at run time.
+    pub frame_mode_word: Option<u64>,
 }
 
 impl Default for ModOptions {
@@ -41,6 +55,7 @@ impl Default for ModOptions {
             disabled: Vec::new(),
             builtin_patches: true,
             mkw_dynamic_fps: false,
+            mkw_frame_mode: MkwFrameMode::Off,
         }
     }
 }
@@ -61,6 +76,7 @@ pub struct Mods {
     program_id: u64,
     builtin_patches: bool,
     mkw_dynamic_fps: bool,
+    mkw_frame_mode: MkwFrameMode,
 }
 
 impl Mods {
@@ -110,6 +126,7 @@ impl Mods {
             program_id,
             builtin_patches: options.builtin_patches,
             mkw_dynamic_fps: options.mkw_dynamic_fps,
+            mkw_frame_mode: options.mkw_frame_mode,
         })
     }
 
@@ -144,8 +161,9 @@ impl Mods {
     /// image then covers its whole size. A patch that fails to parse or apply is logged and
     /// skipped. The built-in patches for the module's build then apply over them, and then an
     /// opt-in mode such as Mario Kart World's dynamic FPS. Returns the swap interval such a mode
-    /// makes the title's presents follow, overriding the one each present names.
-    pub fn patch_modules(&self, modules: &mut [Module]) -> LoaderResult<Option<u32>> {
+    /// makes the title's presents follow, overriding the one each present names, and the frame
+    /// mode word of the adaptive frame mode.
+    pub fn patch_modules(&self, modules: &mut [Module]) -> LoaderResult<AppliedPatches> {
         let mut patches: Vec<(String, [u8; 32], ExefsPatch)> = Vec::new();
         for exefs in self.subdirs("exefs")? {
             let mut entries = exefs.entries()?;
@@ -201,13 +219,21 @@ impl Mods {
                 builtin::apply(self.program_id, module, original.as_deref());
             }
         }
-        let dynamic_fps = self.mkw_dynamic_fps
-            && self.program_id == mkw::MARIO_KART_WORLD
-            && modules
-                .iter_mut()
-                .find(|module| module.name == "main")
-                .is_some_and(mkw::apply_dynamic_fps);
-        Ok(dynamic_fps.then_some(mkw::DYNAMIC_FPS_PRESENT_INTERVAL))
+        let mut applied = AppliedPatches::default();
+        if self.program_id != mkw::MARIO_KART_WORLD {
+            return Ok(applied);
+        }
+        let Some(main) = modules.iter_mut().find(|module| module.name == "main") else {
+            return Ok(applied);
+        };
+        if self.mkw_dynamic_fps && mkw::apply_dynamic_fps(main) {
+            applied.present_interval = Some(mkw::DYNAMIC_FPS_PRESENT_INTERVAL);
+        } else if let Some(mkw::FrameModePatch::Adaptive { word }) =
+            mkw::apply_frame_mode(main, self.mkw_frame_mode)
+        {
+            applied.frame_mode_word = Some(word);
+        }
+        Ok(applied)
     }
 
     /// LayeredFS: rebuilds the RomFS with every mod's `romfs/` and `romfslite/` over the

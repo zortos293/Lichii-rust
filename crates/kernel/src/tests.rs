@@ -312,6 +312,7 @@ impl TestKernel {
             version: 0,
             add_ons: Vec::new(),
             present_interval: None,
+            frame_mode_word: None,
         }
     }
 

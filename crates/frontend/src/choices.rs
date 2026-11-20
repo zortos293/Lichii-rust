@@ -64,6 +64,12 @@ choices!(MemoryLayout {
     Dram8GiB => "8 GiB (unsafe)",
     Dram12GiB => "12 GiB",
 });
+choices!(MkwFrameMode {
+    Off => "Game default",
+    Auto => "60 FPS, 30 FPS at full speed when frames run slow",
+    Sixty => "Always 60 FPS",
+    Thirty => "Always 30 FPS",
+});
 choices!(CpuBackend { Interpreter => "Interpreter (slow)", Jit => "JIT" });
 choices!(CpuAccuracy {
     Auto => "Auto",
