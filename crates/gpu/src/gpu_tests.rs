@@ -1,8 +1,8 @@
 //! End-to-end tests: synthetic pushbuffers in GPU memory, submitted through [`Gpu`] and run on
 //! recording engines and a recording renderer, in both threading modes.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use lichii_memory::{AddressSpace, MemoryPermission, PhysicalMemory};
 use lichii_texture::PixelFormat;
@@ -12,8 +12,8 @@ use parking_lot::{Condvar, Mutex};
 use crate::activity::Wait;
 use crate::backend::{
     ChannelId, ComputeContext, DrawParams, FenceAction, FramebufferConfig, GpuHandles,
-    GpuPredicate, GraphicsContext, IndirectDraw, PendingSemaphore, Query, QueryKind, Rasterizer,
-    ReleaseSize, RenderCondition,
+    GpuPredicate, GraphicsContext, IndirectDraw, Nvn2Submission, PendingSemaphore, Query,
+    QueryKind, Rasterizer, ReleaseSize, RenderCondition, ReplayAdmission, ReplayError,
 };
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
 use crate::clock::{GpuClockSpeed, GuestTime};
@@ -28,6 +28,8 @@ use crate::host1x::Syncpoints;
 use crate::pushbuffer::{CommandHeader, SubmissionMode};
 use crate::reg_index;
 use crate::stream::MIN_RING_SLOTS;
+
+mod nvn2_channel;
 
 const CPU_VA: u64 = 0x1000_0000;
 const MAPPED: u64 = 0x40_0000;
@@ -67,6 +69,9 @@ enum Event {
         payload: u64,
     },
     Fence(FenceAction),
+    Nvn2Attempt,
+    Nvn2Clear,
+    Nvn2Submit,
     Barrier,
     InlineWritten(u64, u64),
     Invalidate(u64, u64),
@@ -178,6 +183,7 @@ struct HostWork {
     /// The device address of a SamplesPassed report the host GPU has yet to write, which the
     /// renderer offers as predicate 0x77.
     samples: Mutex<Option<u64>>,
+    nvn2: OnceLock<Result<ReplayAdmission, ReplayError>>,
 }
 
 #[derive(Default)]
@@ -279,9 +285,14 @@ struct Recorder {
     log: Log,
     work: Arc<HostWork>,
     gate: Arc<Gate>,
+    nvn2_unflushed: bool,
 }
 
 impl Rasterizer for Recorder {
+    fn try_replay_nvn2(&mut self, packet: &Nvn2Submission) -> Result<ReplayAdmission, ReplayError> {
+        self.try_nvn2(packet)
+    }
+
     fn draw(&mut self, _ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
         self.log.lock().push(Event::Draw {
             topology: draw.topology,
@@ -289,7 +300,15 @@ impl Rasterizer for Recorder {
         });
     }
     fn draw_indirect(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &IndirectDraw) {}
-    fn clear(&mut self, _ctx: &mut GraphicsContext<'_>, _layer_count: u32) {}
+    fn clear(&mut self, ctx: &mut GraphicsContext<'_>, _layer_count: u32) {
+        self.standard_nvn2(ctx);
+    }
+
+    fn flush_commands(&mut self) {
+        if std::mem::take(&mut self.nvn2_unflushed) {
+            self.log.lock().push(Event::Nvn2Submit);
+        }
+    }
     fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>) {
         self.log.lock().push(Event::Dispatch {
             grid: ctx.grid,
@@ -556,12 +575,14 @@ impl Rig {
                     pending: Mutex::default(),
                     fence_polls: AtomicUsize::new(0),
                     samples: Mutex::new(None),
+                    nvn2: OnceLock::new(),
                 });
                 work = Some(host.clone());
                 Box::new(Recorder {
                     log: log.clone(),
                     work: host,
                     gate: gate.clone(),
+                    nvn2_unflushed: false,
                 })
             },
         );

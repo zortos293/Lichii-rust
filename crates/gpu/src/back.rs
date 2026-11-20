@@ -44,6 +44,13 @@ pub(crate) struct BackChannelSetup {
 /// Work the CPU side runs on the back thread with the renderer.
 pub(crate) type RasterizerAction = Box<dyn FnOnce(&mut dyn Rasterizer) + Send>;
 
+#[cfg(test)]
+pub(crate) struct Nvn2Work {
+    pub packet: crate::backend::Nvn2Submission,
+    pub standard: RasterizerAction,
+    pub done: mpsc::Sender<Result<crate::backend::ReplayAdmission, crate::backend::ReplayError>>,
+}
+
 /// A CPU-side command forwarded through the stream, so it keeps its order with the methods.
 pub(crate) enum SideCommand {
     CreateChannel(BackChannelSetup),
@@ -53,6 +60,8 @@ pub(crate) enum SideCommand {
     UnmapRegion(DAddr, u64),
     Present(FramebufferConfig),
     Run(RasterizerAction),
+    #[cfg(test)]
+    Nvn2(ChannelId, Box<Nvn2Work>),
     /// The macro code the current channel's [`tag::MACRO`] records run.
     MacroCode(Box<MacroEngine>),
     /// Puts the current channel's 3D registers into [`FetchSyncs::registers`]
@@ -741,6 +750,29 @@ impl Back {
                 self.timestamp.frame_presented();
             }
             SideCommand::Run(action) => action(&mut *self.rasterizer),
+            #[cfg(test)]
+            SideCommand::Nvn2(id, work) => {
+                use crate::backend::ReplayAdmission;
+
+                let Nvn2Work {
+                    packet,
+                    standard,
+                    done,
+                } = *work;
+                assert!(self.channel().is_some_and(|channel| {
+                    channel.setup.id == id && Arc::ptr_eq(&channel.setup.memory, &packet.memory)
+                }));
+                let result = self.rasterizer.try_replay_nvn2(&packet);
+                match result {
+                    Ok(ReplayAdmission::UseStandard) => {
+                        standard(&mut *self.rasterizer);
+                        self.rasterizer.signal_fence(packet.fence);
+                    }
+                    Ok(ReplayAdmission::Recorded) => {}
+                    Err(_) => self.stopping.store(true, Ordering::Relaxed),
+                }
+                let _ = done.send(result);
+            }
             SideCommand::MacroCode(code) => {
                 if let Some(channel) = self.channel() {
                     channel.macros = Some(code);

@@ -88,6 +88,8 @@ pub(crate) struct FrontShared {
 /// A channel's queued work.
 pub(crate) enum Work {
     Entry(GpEntry),
+    #[cfg(test)]
+    Nvn2(Box<crate::back::Nvn2Work>),
     SyncpointWait(SyncpointFence),
     /// Increments, and the fence they reach.
     Increment(SyncpointIncrement, Option<SyncpointFence>, u64),
@@ -657,6 +659,13 @@ impl FrontChannel {
         while let Some(work) = self.queue.front() {
             match *work {
                 Work::Entry(entry) => self.run_entry(entry, shared),
+                #[cfg(test)]
+                Work::Nvn2(_) => {
+                    let Some(Work::Nvn2(work)) = self.queue.pop_front() else {
+                        unreachable!("the queue's front was just matched");
+                    };
+                    shared.stream.side(SideCommand::Nvn2(self.id, work));
+                }
                 Work::SyncpointWait(fence) => {
                     self.queue.pop_front();
                     self.dispatch(shared).syncpoint_wait(fence);

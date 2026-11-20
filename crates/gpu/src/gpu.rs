@@ -107,6 +107,8 @@ enum CpuCommand {
     DestroyChannel(ChannelId),
     BindAddressSpace(ChannelId, Arc<Gmmu>),
     Submit(ChannelId, QueuedSubmission),
+    #[cfg(test)]
+    SubmitNvn2(ChannelId, Box<crate::back::Nvn2Work>),
     Side(SideCommand),
     Synchronize(mpsc::SyncSender<()>),
 }
@@ -371,6 +373,18 @@ impl Front {
                 }
                 channel.push(Work::EndOfSubmission);
                 channel.run(&mut self.shared);
+            }
+            #[cfg(test)]
+            CpuCommand::SubmitNvn2(id, work) => {
+                if let Some(channel) = self
+                    .channels
+                    .get_mut(id.0 as usize)
+                    .and_then(Option::as_mut)
+                {
+                    channel.push(Work::Nvn2(work));
+                    channel.push(Work::EndOfSubmission);
+                    channel.run(&mut self.shared);
+                }
             }
             CpuCommand::Side(command) => self.shared.stream.side(command),
             CpuCommand::Synchronize(done) => {
@@ -872,6 +886,12 @@ impl Gpu {
     pub(crate) fn pooled_entry_buffers(&self) -> Vec<usize> {
         let state = self.inbox.state.lock();
         state.entry_buffers.iter().map(Vec::capacity).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_nvn2(&self, channel: ChannelId, work: crate::back::Nvn2Work) {
+        self.inbox
+            .push(CpuCommand::SubmitNvn2(channel, Box::new(work)));
     }
 
     fn side(&self, command: SideCommand) {
