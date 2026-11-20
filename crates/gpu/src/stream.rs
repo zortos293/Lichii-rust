@@ -18,6 +18,7 @@ use crate::backend::{ChannelId, ReleaseSize};
 use crate::engines::EngineKind;
 use crate::gpu::Inbox;
 use crate::host::Reduction;
+use crate::queue_trace::{Event, QueueTrace};
 use crate::ring::{Consumer, Producer};
 
 pub(crate) mod tag {
@@ -100,6 +101,7 @@ pub(crate) const fn header(tag: u8, engine: u8, method: u32, argument: u32) -> u
 pub(crate) struct FetchSyncs {
     completed: AtomicU64,
     front: Arc<Inbox>,
+    queue_trace: Option<Arc<QueueTrace>>,
     /// What pending semaphore releases write over the read [`Stream::synchronize_read`] last sent.
     pub(crate) read_overlay: ReadOverlay,
     /// The 3D registers [`Stream::fetch_registers`] asks for, each with its value and shadow RAM
@@ -108,10 +110,11 @@ pub(crate) struct FetchSyncs {
 }
 
 impl FetchSyncs {
-    pub(crate) fn new(front: Arc<Inbox>) -> Self {
+    pub(crate) fn new(front: Arc<Inbox>, queue_trace: Option<Arc<QueueTrace>>) -> Self {
         Self {
             completed: AtomicU64::new(0),
             front,
+            queue_trace,
             read_overlay: ReadOverlay::default(),
             registers: Mutex::new(Vec::new()),
         }
@@ -119,7 +122,10 @@ impl FetchSyncs {
 
     /// The back synchronized the next fetch: counts it and wakes the front.
     pub(crate) fn complete(&self) {
-        self.completed.fetch_add(1, Ordering::Release);
+        let previous = self.completed.fetch_add(1, Ordering::Release);
+        if let Some(trace) = &self.queue_trace {
+            trace.record(Event::FetchReady(previous + 1));
+        }
         self.front.wake();
     }
 }

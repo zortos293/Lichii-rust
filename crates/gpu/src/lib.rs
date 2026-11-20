@@ -23,6 +23,7 @@ pub mod lazy;
 pub mod macros;
 pub mod nx2_memory;
 pub mod pushbuffer;
+mod queue_trace;
 mod ring;
 pub mod semaphore_mirror;
 mod stream;

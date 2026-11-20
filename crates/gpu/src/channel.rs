@@ -18,6 +18,7 @@ use crate::gmmu::Gmmu;
 use crate::gpu::{Console, Inbox};
 use crate::host::{AcquireOp, HostClass};
 pub use crate::pushbuffer::GpEntry;
+use crate::queue_trace::{Event, QueueTrace};
 
 /// How a channel is set up.
 #[derive(Clone)]
@@ -134,6 +135,7 @@ pub struct SemaphoreWaiters {
     count: AtomicUsize,
     list: Mutex<Vec<Waiter>>,
     front: OnceLock<Weak<Inbox>>,
+    trace: OnceLock<Arc<QueueTrace>>,
     published: AtomicU64,
     current_dependency: AtomicU64,
     wake_after_publish: AtomicBool,
@@ -147,6 +149,14 @@ struct Waiter {
     wide: bool,
     latched: Option<Latch>,
     mode: WaitMode,
+    trace_id: u64,
+}
+
+pub(crate) struct Acquire {
+    pub address: SemaphoreAddress,
+    pub payload: u64,
+    pub op: AcquireOp,
+    pub wide: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +201,10 @@ impl Waiter {
 }
 
 impl SemaphoreWaiters {
+    pub(crate) fn attach_trace(&self, trace: Arc<QueueTrace>) {
+        let _ = self.trace.set(trace);
+    }
+
     /// Wakes `inbox` whenever a write latches a waiter.
     pub(crate) fn attach(&self, inbox: &Arc<Inbox>) {
         if self.front.set(Arc::downgrade(inbox)).is_err() {
@@ -199,28 +213,21 @@ impl SemaphoreWaiters {
     }
 
     /// Registers `channel` as waiting until the word at `address` meets the acquire.
-    pub(crate) fn add(
-        &self,
-        channel: ChannelId,
-        address: SemaphoreAddress,
-        payload: u64,
-        op: AcquireOp,
-        wide: bool,
-        ordered: bool,
-    ) {
+    pub(crate) fn add(&self, channel: ChannelId, acquire: Acquire, ordered: bool, trace_id: u64) {
         let mut list = self.list.lock();
         list.push(Waiter {
             channel,
-            address,
-            payload,
-            op,
-            wide,
+            address: acquire.address,
+            payload: acquire.payload,
+            op: acquire.op,
+            wide: acquire.wide,
             latched: None,
             mode: if ordered {
                 WaitMode::Unarmed
             } else {
                 WaitMode::Memory
             },
+            trace_id,
         });
         self.count.store(list.len(), Ordering::Release);
     }
@@ -265,7 +272,10 @@ impl SemaphoreWaiters {
             first: fence,
             last: fence,
         };
-        if value.is_some_and(|value| waiter.op.is_met(value, waiter.payload, waiter.wide)) {
+        if let Some(value) =
+            value.filter(|&value| waiter.op.is_met(value, waiter.payload, waiter.wide))
+        {
+            self.trace_latch(waiter, fence, value, true);
             waiter.latched = Some(Latch::Queued(fence));
         }
         drop(list);
@@ -319,7 +329,10 @@ impl SemaphoreWaiters {
             };
             if let Some(value) = observation {
                 *last = fence;
-                if value.is_some_and(|value| waiter.op.is_met(value, waiter.payload, waiter.wide)) {
+                if let Some(value) =
+                    value.filter(|&value| waiter.op.is_met(value, waiter.payload, waiter.wide))
+                {
+                    self.trace_latch(waiter, fence, value, true);
                     waiter.latched = Some(Latch::Queued(fence));
                     latched = true;
                 }
@@ -333,6 +346,14 @@ impl SemaphoreWaiters {
     fn wake_front(&self) {
         if let Some(front) = self.front.get().and_then(Weak::upgrade) {
             front.wake();
+        }
+    }
+
+    fn trace_latch(&self, waiter: &Waiter, fence: u64, value: u64, queued: bool) {
+        if waiter.trace_id != 0
+            && let Some(trace) = self.trace.get()
+        {
+            trace.record(Event::Latch(waiter.trace_id, fence, value, queued));
         }
     }
 
@@ -361,6 +382,7 @@ impl SemaphoreWaiters {
                 continue;
             }
             if waiter.op.is_met(u64::from(value), waiter.payload, false) {
+                self.trace_latch(waiter, fence, u64::from(value), false);
                 waiter.latched = Some(Latch::Written(fence));
                 latched = true;
             }
@@ -402,7 +424,10 @@ impl SemaphoreWaiters {
             } else {
                 device.read::<u32>(at).map(u64::from)
             };
-            if current.is_ok_and(|current| waiter.op.is_met(current, waiter.payload, waiter.wide)) {
+            if let Ok(current) = current
+                && waiter.op.is_met(current, waiter.payload, waiter.wide)
+            {
+                self.trace_latch(waiter, fence, current, false);
                 waiter.latched = Some(Latch::Written(fence));
                 latched = true;
             }
@@ -424,14 +449,17 @@ mod tests {
         let word = 0x2000;
         waiters.add(
             channel,
-            SemaphoreAddress {
-                low: Some(word),
-                high: None,
+            Acquire {
+                address: SemaphoreAddress {
+                    low: Some(word),
+                    high: None,
+                },
+                payload: 1,
+                op: AcquireOp::Equal,
+                wide: false,
             },
-            1,
-            AcquireOp::Equal,
-            false,
             true,
+            0,
         );
         waiters.arm(channel, 2, None);
         waiters.met_by(word, 1, 1);

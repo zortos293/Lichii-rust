@@ -119,6 +119,7 @@ struct QueuedSubmission {
     increment: Option<SyncpointIncrement>,
     /// The value the increments reach.
     fence: Option<SyncpointFence>,
+    trace_sample: u64,
 }
 
 /// Entry buffers the inbox keeps for later submissions; more are dropped once the front is done
@@ -347,6 +348,7 @@ impl Front {
                     wait,
                     increment,
                     fence,
+                    trace_sample,
                 } = submission;
                 let Some(channel) = self
                     .channels
@@ -365,7 +367,7 @@ impl Front {
                 }
                 self.shared.inbox.recycle(entries);
                 if let Some(increment) = increment {
-                    channel.push(Work::Increment(increment, fence));
+                    channel.push(Work::Increment(increment, fence, trace_sample));
                 }
                 channel.push(Work::EndOfSubmission);
                 channel.run(&mut self.shared);
@@ -407,7 +409,7 @@ impl Front {
     fn resume(&mut self) -> bool {
         let mut resumed = false;
         for channel in self.channels.iter_mut().flatten() {
-            if channel.is_runnable(&self.shared) {
+            if channel.probe_runnable(&self.shared) {
                 channel.run(&mut self.shared);
                 resumed = true;
             } else {
@@ -474,7 +476,7 @@ impl Gpu {
             timestamp: Arc::new(GpuTimestamp::new(time, config.nanosecond_timestamps)),
             written_pages: host1x.written_pages.clone(),
             lazy: host1x.lazy.clone(),
-            activity: Arc::new(Activity::new()),
+            activity: Arc::new(Activity::for_gpu()),
         };
         let nx2_memory = (config.console == Console::Switch2).then(|| {
             Nx2GpuMemory::new(
@@ -488,10 +490,20 @@ impl Gpu {
         let ordered_semaphore_acquires = rasterizer.ordered_semaphore_acquires();
         let inbox = Arc::new(Inbox::new());
         handles.syncpoints.semaphore_waiters().attach(&inbox);
+        if let Some(trace) = &handles.activity.queue_trace {
+            handles
+                .syncpoints
+                .semaphore_waiters()
+                .attach_trace(trace.clone());
+            handles.syncpoints.host().attach_trace(trace.clone());
+        }
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
         let back_progress = producer.progress();
         let (side_sender, side_receiver) = mpsc::channel();
-        let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
+        let fetch_syncs = Arc::new(FetchSyncs::new(
+            inbox.clone(),
+            handles.activity.queue_trace.clone(),
+        ));
         let activity = handles.activity.clone();
         let stopping = Arc::new(AtomicBool::new(false));
         let wake = || -> Box<dyn Fn() + Send + Sync> {
@@ -539,6 +551,7 @@ impl Gpu {
                 words: Vec::new(),
                 waiters: handles.syncpoints.semaphore_waiters().clone(),
                 ordered_semaphore_acquires,
+                queue_trace: activity.queue_trace.clone(),
                 inbox: inbox.clone(),
                 syncpoints: handles.syncpoints.clone(),
                 written_pages: (config.console == Console::Switch2)
@@ -707,6 +720,19 @@ impl Gpu {
                 }
             });
             let mut entries = pool.pop().unwrap_or_default();
+            let trace_sample =
+                fence
+                    .zip(self.activity.queue_trace.as_deref())
+                    .map_or(0, |(fence, trace)| {
+                        let sample = trace.id();
+                        trace.record(crate::queue_trace::Event::Submit(
+                            channel.0,
+                            fence.id,
+                            fence.value,
+                            sample,
+                        ));
+                        sample
+                    });
             entries.extend_from_slice(submission.entries);
             Some(CpuCommand::Submit(
                 channel,
@@ -715,6 +741,7 @@ impl Gpu {
                     wait: submission.wait,
                     increment: submission.increment,
                     fence,
+                    trace_sample,
                 },
             ))
         });

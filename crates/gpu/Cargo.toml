@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
+crossbeam-channel.workspace = true
 lichii-common.workspace = true
 lichii-memory.workspace = true
 lichii-texture.workspace = true

@@ -421,21 +421,17 @@ fn perform_release(ctx: &mut EngineContext<'_>, release: &Release) {
                 }
                 return;
             }
-            ctx.rasterizer.query(
-                ctx.channel,
-                ctx.memory,
-                &Query {
-                    address,
-                    kind: QueryKind::Payload,
-                    payload: u64::from(payload),
-                    size: if timestamped {
-                        ReleaseSize::Sixteen
-                    } else {
-                        ReleaseSize::Four
-                    },
-                    after_work: true,
+            ctx.query(&Query {
+                address,
+                kind: QueryKind::Payload,
+                payload: u64::from(payload),
+                size: if timestamped {
+                    ReleaseSize::Sixteen
+                } else {
+                    ReleaseSize::Four
                 },
-            );
+                after_work: true,
+            });
             return;
         }
     };
@@ -443,12 +439,15 @@ fn perform_release(ctx: &mut EngineContext<'_>, release: &Release) {
         tracing::warn!(address, "compute reduction on unmapped memory");
         return;
     };
-    ctx.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
+    ctx.signal_semaphore(
         address,
-        op,
-        signed,
-        payload,
-    });
+        FenceAction::ReduceSemaphore {
+            address,
+            op,
+            signed,
+            payload,
+        },
+    );
 }
 
 #[cfg(test)]

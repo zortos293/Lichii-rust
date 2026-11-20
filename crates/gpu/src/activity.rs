@@ -84,6 +84,7 @@ impl WaitClock {
 /// Counters the GPU threads add to, and the reporter thread logs and resets.
 #[derive(Debug)]
 pub struct Activity {
+    pub(crate) queue_trace: Option<std::sync::Arc<crate::queue_trace::QueueTrace>>,
     base: Instant,
     calls: [AtomicU64; 4],
     renderer_ns: AtomicU64,
@@ -129,6 +130,7 @@ impl Drop for Waiting<'_> {
 impl Activity {
     pub fn new() -> Self {
         Self {
+            queue_trace: None,
             base: Instant::now(),
             calls: [const { AtomicU64::new(0) }; 4],
             renderer_ns: AtomicU64::new(0),
@@ -138,6 +140,13 @@ impl Activity {
             waits: [const { WaitClock::new() }; 4],
             stopped: Mutex::new(false),
             stop: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn for_gpu() -> Self {
+        Self {
+            queue_trace: crate::queue_trace::QueueTrace::if_enabled().map(std::sync::Arc::new),
+            ..Self::new()
         }
     }
 
@@ -199,8 +208,24 @@ impl Activity {
         let mut watch = StallWatch::default();
         let mut syncpoint_watch = SyncpointWatch::default();
         let mut stopped = self.stopped.lock();
-        while !*stopped {
-            self.stop.wait_for(&mut stopped, STALL_CHECK);
+        loop {
+            if !*stopped {
+                self.stop.wait_for(&mut stopped, STALL_CHECK);
+            }
+            if let Some(trace) = &self.queue_trace {
+                let end = *stopped;
+                drop(stopped);
+                trace.drain(end);
+                if end {
+                    return;
+                }
+                stopped = self.stopped.lock();
+                if *stopped {
+                    drop(stopped);
+                    trace.drain(true);
+                    return;
+                }
+            }
             if *stopped {
                 return;
             }

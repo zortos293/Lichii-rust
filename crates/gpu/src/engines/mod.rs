@@ -16,7 +16,7 @@ use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::GobLayout;
 
 use crate::activity::Activity;
-use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer, RenderCondition};
+use crate::backend::{ChannelId, FenceAction, GpuWrittenPages, Query, Rasterizer, RenderCondition};
 use crate::gmmu::Gmmu;
 use crate::host1x::Syncpoints;
 
@@ -207,6 +207,28 @@ pub struct EngineContext<'a> {
 }
 
 impl EngineContext<'_> {
+    pub(crate) fn query(&mut self, query: &Query) {
+        let signal =
+            |rasterizer: &mut dyn Rasterizer| rasterizer.query(self.channel, self.memory, query);
+        if let Some(trace) = &self.activity.queue_trace
+            && let Some(address) = self.memory.translate(query.address)
+        {
+            trace.track_producer(self.rasterizer, self.channel, address, signal);
+        } else {
+            signal(self.rasterizer);
+        }
+    }
+
+    pub(crate) fn signal_semaphore(&mut self, address: lichii_common::DAddr, action: FenceAction) {
+        if let Some(trace) = &self.activity.queue_trace {
+            trace.track_producer(self.rasterizer, self.channel, address, |rasterizer| {
+                rasterizer.signal_fence(action);
+            });
+        } else {
+            self.rasterizer.signal_fence(action);
+        }
+    }
+
     /// Software memory accesses don't run on the GPU queue. Finish any dependency an acquire
     /// observed there before touching guest RAM directly.
     pub(crate) fn finish_semaphore_dependency(&mut self) {
