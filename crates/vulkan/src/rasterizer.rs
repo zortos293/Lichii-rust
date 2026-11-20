@@ -7,6 +7,7 @@
 //! dispatches (see [`draw`]).
 
 mod conditions;
+mod direct_nvn;
 mod draw;
 mod fence_waiter;
 mod frame_dump;
