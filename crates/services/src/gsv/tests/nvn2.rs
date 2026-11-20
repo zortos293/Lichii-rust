@@ -771,10 +771,27 @@ fn protected_range_mutations_fail_closed_but_whole_remap_waits() {
         ResultCode::SUCCESS
     );
     assert_eq!(f.destroy(handle, 5), BUSY);
+    let refused = f.slot(6);
+    assert_eq!(f.destroy(other, 6), BUSY);
+    assert!(!refused.is_signaled());
     let weak = f.remove_cpu_mapping(target);
     let slot = f.slot(3);
     assert!(!slot.is_signaled());
     let gpu = &f.context.gpu;
+    let registry = gpu.nx2_memory().unwrap();
+    assert!(matches!(
+        registry.destroy(other),
+        Err(Nx2MemoryError::Nvn2TargetInUse { .. })
+    ));
+    assert!(matches!(
+        registry.create_gpu_accessible_memory_as(
+            other,
+            f.client.process().memory(),
+            f.heap + SIZE,
+            SIZE,
+        ),
+        Err(Nx2MemoryError::Nvn2TargetInUse { .. })
+    ));
     gpu.host1x().syncpoints.host().increment(gate).unwrap();
     gpu.wake();
     assert_eq!(
@@ -790,6 +807,7 @@ fn protected_range_mutations_fail_closed_but_whole_remap_waits() {
         (daddr, pa, PIXEL)
     );
     assert!(!slot.is_signaled());
+    assert_eq!(f.destroy(other, 6), BUSY);
     f.allow_writeback.send(()).unwrap();
     until(|| slot.is_signaled());
     assert_eq!(f.space.translate(f.base), Some(other_daddr));
@@ -804,4 +822,9 @@ fn protected_range_mutations_fail_closed_but_whole_remap_waits() {
     assert!(weak.upgrade().is_none());
     assert_eq!(gpu.host1x().memory.physical_address(daddr), None);
     assert_eq!(f.space.translate(f.base), Some(other_daddr));
+    assert_eq!(f.destroy(other, 7), ResultCode::SUCCESS);
+    let replacement_destroyed = f.slot(7);
+    until(|| replacement_destroyed.is_signaled());
+    assert_eq!(f.space.translate(f.base), None);
+    assert!(!refused.is_signaled());
 }

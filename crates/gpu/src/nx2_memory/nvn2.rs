@@ -47,8 +47,11 @@ type Ready = Box<dyn FnOnce(Arc<Target>) + Send>;
 enum Use {
     Available,
     Held,
-    Retiring(Option<Ready>),
-    Quiescent,
+    Retiring {
+        mutation: Nvn2Mutation,
+        ready: Option<Ready>,
+    },
+    Quiescent(Nvn2Mutation),
     Failed,
 }
 
@@ -94,6 +97,13 @@ impl Target {
         aliases(device, daddr, size, self.pa, self.size)
     }
 
+    pub(super) fn reserves_remap_source(&self, raw: u32) -> bool {
+        let usage = self.usage.lock();
+        matches!(*usage,
+            Use::Retiring { mutation: Nvn2Mutation::Remap { handle, .. }, .. } |
+            Use::Quiescent(Nvn2Mutation::Remap { handle, .. }) if handle.raw() == raw)
+    }
+
     fn release(self: Arc<Self>) {
         let ready = {
             let mut usage = self.usage.lock();
@@ -102,9 +112,9 @@ impl Target {
                     *usage = Use::Available;
                     None
                 }
-                Use::Retiring(ready) => {
+                Use::Retiring { mutation, ready } => {
                     let ready = ready.take();
-                    *usage = Use::Quiescent;
+                    *usage = Use::Quiescent(*mutation);
                     ready
                 }
                 _ => None,
@@ -170,26 +180,27 @@ impl Nvn2TargetLease {
 /// Owns a retiring mapping and its physical backing until the renderer confirms writeback.
 pub struct Nvn2Retirement {
     target: Arc<Target>,
-    mutation: Nvn2Mutation,
 }
 
 impl Nvn2Retirement {
     /// Runs `ready` outside the locks once queued or in-flight use is gone. It must schedule
     /// retirement, not wait for the GPU from a queue or fence callback.
     pub(crate) fn when_quiescent(self, ready: Box<dyn FnOnce(Nvn2Retirement) + Send>) {
-        let Self { target, mutation } = self;
+        let Self { target } = self;
         {
             let mut usage = target.usage.lock();
             match &mut *usage {
-                Use::Retiring(callback) => {
-                    *callback = Some(Box::new(move |target| ready(Self { target, mutation })));
+                Use::Retiring {
+                    ready: callback, ..
+                } => {
+                    *callback = Some(Box::new(move |target| ready(Self { target })));
                     return;
                 }
-                Use::Quiescent => {}
+                Use::Quiescent(_) => {}
                 _ => return,
             }
         }
-        ready(Self { target, mutation });
+        ready(Self { target });
     }
 }
 
@@ -370,7 +381,11 @@ impl Nx2GpuMemory {
         };
         match mutation {
             Nvn2Mutation::Destroy(handle) if handle != target.handle => {
-                return Nvn2RetirementAdmission::Untracked;
+                return if target.reserves_remap_source(handle.raw()) {
+                    Nvn2RetirementAdmission::Refused
+                } else {
+                    Nvn2RetirementAdmission::Untracked
+                };
             }
             Nvn2Mutation::Destroy(_) => {}
             Nvn2Mutation::Remap {
@@ -399,13 +414,17 @@ impl Nx2GpuMemory {
         }
         let mut usage = target.usage.lock();
         match *usage {
-            Use::Available => *usage = Use::Quiescent,
-            Use::Held => *usage = Use::Retiring(None),
+            Use::Available => *usage = Use::Quiescent(mutation),
+            Use::Held => {
+                *usage = Use::Retiring {
+                    mutation,
+                    ready: None,
+                }
+            }
             _ => return Nvn2RetirementAdmission::Refused,
         }
         Nvn2RetirementAdmission::Deferred(Nvn2Retirement {
             target: target.clone(),
-            mutation,
         })
     }
 
@@ -427,11 +446,13 @@ impl Nx2GpuMemory {
     ) -> Result<(), Nx2MemoryError> {
         let mut state = self.state.lock();
         if !matches!(&state.nvn2, Some(Registration::Mapped(target)) if Arc::ptr_eq(target, &ready.target))
-            || !matches!(*ready.target.usage.lock(), Use::Quiescent)
         {
             return Err(ready.target.busy());
         }
-        state.nvn2 = match ready.mutation {
+        let Use::Quiescent(mutation) = *ready.target.usage.lock() else {
+            return Err(ready.target.busy());
+        };
+        state.nvn2 = match mutation {
             Nvn2Mutation::Destroy(handle) => {
                 self.destroy_locked(&mut state, handle)?;
                 None

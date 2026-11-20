@@ -251,6 +251,11 @@ impl Nx2GpuMemory {
         let handle = handle.raw();
         let mut state = self.state.lock();
         state.guard_nvn2(Some(handle), cpu_va, size)?;
+        if let Some(nvn2::Registration::Mapped(target)) = &state.nvn2
+            && target.reserves_remap_source(handle)
+        {
+            return Err(target.busy());
+        }
         let daddr = self
             .allocator
             .allocate(size, DEVICE_ALIGN)
@@ -304,7 +309,9 @@ impl Nx2GpuMemory {
     pub fn destroy(&self, handle: GpuMemoryHandle) -> Result<Vec<Unmapped>, Nx2MemoryError> {
         let mut state = self.state.lock();
         let release = match &state.nvn2 {
-            Some(nvn2::Registration::Mapped(target)) if target.handle == handle => {
+            Some(nvn2::Registration::Mapped(target))
+                if target.handle == handle || target.reserves_remap_source(handle.raw()) =>
+            {
                 return Err(target.busy());
             }
             Some(nvn2::Registration::Remapped(target)) => target.handle == handle,
