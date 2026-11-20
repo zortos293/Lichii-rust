@@ -24,8 +24,9 @@ pub mod title;
 pub mod zstd;
 
 pub use crate::error::{LoaderError, LoaderResult};
+pub use crate::mkw::{FRAME_MODE_SIXTY, FRAME_MODE_THIRTY};
 pub use crate::npdm::Npdm;
-pub use crate::patch::{ModOptions, Mods};
+pub use crate::patch::{AppliedPatches, ModOptions, Mods};
 pub use crate::program::{
     AddOnContent, MainThread, Mod0, Module, Permission, ProgramImage, Segment,
 };

@@ -13,6 +13,13 @@
 //!   every 2-step frame reads as 33 ms and the game never leaves 30 FPS (found by SerkiGohan).
 //!
 //! Presents are then paced at [`DYNAMIC_FPS_PRESENT_INTERVAL`].
+//!
+//! The frame mode (an opt-in port of the C++ Lichii's `mkw_60fps_fallback`) instead pins the mode
+//! load to 1 (60 FPS, one 1/60 s step a frame) or 2 (30 FPS, one 1/30 s step a frame, full speed
+//! at half the frame rate). The adaptive mode has the load read a word the emulator owns, from a
+//! stub in the zero padding that ends .text, so `nx2:vi2` can switch between the two at run time.
+
+use lichii_common::settings::MkwFrameMode;
 
 use crate::program::Module;
 
@@ -31,6 +38,16 @@ const FRAME_COST_LOAD: u32 = 0xF940_9660;
 const WHOLE_FRAME_TIME_LOAD: u32 = 0xF940_7660;
 const LDR_W8_INTERVAL: u32 = 0xB940_8A68;
 const CMP_W8_2: u32 = 0x7100_091F;
+const MOV_W8_SIXTY: u32 = 0x5280_0028;
+const MOV_W8_THIRTY: u32 = 0x5280_0048;
+/// `ldr w8, #8 ; ret`, then the mode word.
+const MODE_STUB: [u32; 2] = [0x1800_0048, 0xD65F_03C0];
+/// The mode word's value for one 1/60 s step a frame.
+pub const FRAME_MODE_SIXTY: u32 = 1;
+/// The mode word's value for one 1/30 s step a frame.
+pub const FRAME_MODE_THIRTY: u32 = 2;
+/// A `bl` reaches 128 MiB either way.
+const BL_REACH: i64 = 1 << 25;
 
 fn is_b_ne(word: u32) -> bool {
     word & 0xFF00_001F == 0x5400_0001
@@ -50,6 +67,82 @@ fn single(mut indices: impl Iterator<Item = usize>) -> Option<usize> {
     indices.next().is_none().then_some(first)
 }
 
+/// The one frame mode load in `words`: after `cmp w9, w1 ; b.ne`, before `cbnz w8`, with the
+/// move of 60.0f among the next words.
+fn mode_site(words: &[u32]) -> Option<usize> {
+    let word = |i: usize| words.get(i).copied().unwrap_or(0);
+    single((2..words.len().saturating_sub(8)).filter(|&i| {
+        word(i) == MODE_LOAD
+            && word(i - 2) == CMP_W9_W1
+            && is_b_ne(word(i - 1))
+            && is_cbnz_w8(word(i + 1))
+            && (i + 2..i + 8).any(|j| word(j) == MOV_W8_60F)
+    }))
+}
+
+/// What [`apply_frame_mode`] changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameModePatch {
+    /// The mode load became a constant.
+    Fixed,
+    /// The mode load reads the word at `word`, a byte offset in the module that starts at 1.
+    Adaptive { word: u64 },
+}
+
+/// Applies `mode` to Mario Kart World's `main` and returns what it did, `None` when `mode` is
+/// off or the mode load is not found exactly once (or, for the adaptive mode, has no stub room or
+/// is out of reach of the stub). Nothing changes then.
+pub(crate) fn apply_frame_mode(module: &mut Module, mode: MkwFrameMode) -> Option<FrameModePatch> {
+    if mode == MkwFrameMode::Off {
+        return None;
+    }
+    let text = &module.segments[0];
+    let start = text.offset as usize;
+    let code = module.image.get_mut(start..start + text.size as usize)?;
+    let words: Vec<u32> = code
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&word| u32::from_le_bytes(word))
+        .collect();
+    let Some(site) = mode_site(&words) else {
+        tracing::warn!("Mario Kart World frame mode skipped: the mode load is not found once");
+        return None;
+    };
+    let edits: Vec<(usize, u32)> = match mode {
+        MkwFrameMode::Off => return None,
+        MkwFrameMode::Sixty => vec![(site, MOV_W8_SIXTY)],
+        MkwFrameMode::Thirty => vec![(site, MOV_W8_THIRTY)],
+        MkwFrameMode::Auto => {
+            let cave = words.iter().rposition(|&word| word != 0)? + 2;
+            let reach = cave as i64 - site as i64;
+            if cave + MODE_STUB.len() >= words.len() || reach.abs() >= BL_REACH {
+                tracing::warn!("Mario Kart World frame mode skipped: no room for its stub");
+                return None;
+            }
+            vec![
+                (cave, MODE_STUB[0]),
+                (cave + 1, MODE_STUB[1]),
+                (cave + 2, FRAME_MODE_SIXTY),
+                (site, 0x9400_0000 | (reach as u32 & 0x03FF_FFFF)),
+            ]
+        }
+    };
+    for &(index, value) in &edits {
+        code[index * 4..][..4].copy_from_slice(&value.to_le_bytes());
+    }
+    tracing::info!(
+        "Mario Kart World: frame mode {mode:?} (main+{:#x})",
+        start + site * 4
+    );
+    Some(match mode {
+        MkwFrameMode::Auto => FrameModePatch::Adaptive {
+            word: (start + edits[2].0 * 4) as u64,
+        },
+        _ => FrameModePatch::Fixed,
+    })
+}
+
 /// Applies the dynamic FPS mode to Mario Kart World's `main` and returns whether it did. It
 /// applies whole or not at all: each of the three sites must match exactly once.
 pub(crate) fn apply_dynamic_fps(module: &mut Module) -> bool {
@@ -65,13 +158,7 @@ pub(crate) fn apply_dynamic_fps(module: &mut Module) -> bool {
         .map(|&word| u32::from_le_bytes(word))
         .collect();
     let word = |i: usize| words.get(i).copied().unwrap_or(0);
-    let mode = single((2..words.len().saturating_sub(8)).filter(|&i| {
-        word(i) == MODE_LOAD
-            && word(i - 2) == CMP_W9_W1
-            && is_b_ne(word(i - 1))
-            && is_cbnz_w8(word(i + 1))
-            && (i + 2..i + 8).any(|j| word(j) == MOV_W8_60F)
-    }));
+    let mode = mode_site(&words);
     let frame_cost = mode.and_then(|mode| {
         single(
             (mode + 1..(mode + 32).min(words.len()))
@@ -118,7 +205,7 @@ mod tests {
     use crate::npdm::tests::{NpdmSpec, build_npdm};
     use crate::nso::HashCheck;
     use crate::nso::tests::{Compression, build_nso, segments};
-    use crate::patch::{ModOptions, Mods};
+    use crate::patch::{AppliedPatches, ModOptions, Mods};
     use crate::title::tests::TempDir;
     use crate::title::{LoadOptions, load};
     use lichii_fs::MemDir;
@@ -189,7 +276,26 @@ mod tests {
             .unwrap()
             .patch_modules(&mut modules)
             .unwrap();
-        (modules.remove(0), interval)
+        (modules.remove(0), interval.present_interval)
+    }
+
+    fn with_frame_mode(
+        module: &Module,
+        title: u64,
+        mkw_dynamic_fps: bool,
+        mkw_frame_mode: MkwFrameMode,
+    ) -> (Module, AppliedPatches) {
+        let options = ModOptions {
+            mkw_dynamic_fps,
+            mkw_frame_mode,
+            ..ModOptions::default()
+        };
+        let mut modules = vec![module.clone()];
+        let applied = Mods::find(&options, title)
+            .unwrap()
+            .patch_modules(&mut modules)
+            .unwrap();
+        (modules.remove(0), applied)
     }
 
     #[test]
@@ -260,5 +366,105 @@ mod tests {
         let module = fake_main(&[(VBLANK + 2, 0x54FF_FF83)]);
         let (patched, _) = patched(&module, MARIO_KART_WORLD, true);
         assert_eq!(word(&patched, VBLANK + 2), 0x17FF_FFFC);
+    }
+
+    #[test]
+    fn the_adaptive_frame_mode_calls_a_stub_after_the_text() {
+        let module = fake_main(&[]);
+        let (patched, applied) =
+            with_frame_mode(&module, MARIO_KART_WORLD, false, MkwFrameMode::Auto);
+        let cave = VBLANK + 4 + 2;
+        assert_eq!(applied.present_interval, None);
+        assert_eq!(applied.frame_mode_word, Some(((cave + 2) * 4) as u64));
+        assert_eq!(word(&patched, MODE), 0x9400_0000 | (cave - MODE) as u32);
+        assert_eq!(word(&patched, cave), MODE_STUB[0]);
+        assert_eq!(word(&patched, cave + 1), MODE_STUB[1]);
+        assert_eq!(word(&patched, cave + 2), FRAME_MODE_SIXTY);
+        let changed: Vec<usize> = (0..TEXT_WORDS)
+            .filter(|&i| word(&patched, i) != word(&module, i))
+            .collect();
+        assert_eq!(changed, [MODE, cave, cave + 1, cave + 2]);
+    }
+
+    #[test]
+    fn the_fixed_frame_modes_move_one_constant() {
+        let module = fake_main(&[]);
+        for (mode, expected) in [
+            (MkwFrameMode::Sixty, MOV_W8_SIXTY),
+            (MkwFrameMode::Thirty, MOV_W8_THIRTY),
+        ] {
+            let (patched, applied) = with_frame_mode(&module, MARIO_KART_WORLD, false, mode);
+            assert_eq!(applied, AppliedPatches::default());
+            let changed: Vec<usize> = (0..TEXT_WORDS)
+                .filter(|&i| word(&patched, i) != word(&module, i))
+                .collect();
+            assert_eq!(changed, [MODE]);
+            assert_eq!(word(&patched, MODE), expected);
+        }
+        assert_eq!(MOV_W8_SIXTY >> 5 & 0xFFFF, FRAME_MODE_SIXTY);
+        assert_eq!(MOV_W8_THIRTY >> 5 & 0xFFFF, FRAME_MODE_THIRTY);
+    }
+
+    #[test]
+    fn the_frame_mode_needs_its_setting_title_and_a_single_site() {
+        let module = fake_main(&[]);
+        let cases = [
+            (MARIO_KART_WORLD, MkwFrameMode::Off, false),
+            (MARIO_KART_WORLD + 0x1000, MkwFrameMode::Auto, false),
+            // The dynamic mode already took the mode load.
+            (MARIO_KART_WORLD, MkwFrameMode::Auto, true),
+        ];
+        for (title, mode, dynamic) in cases {
+            let (patched, applied) = with_frame_mode(&module, title, dynamic, mode);
+            assert_eq!(applied.frame_mode_word, None);
+            assert_eq!(patched.image == module.image, !dynamic);
+        }
+        let twice = fake_main(&at(
+            0x900,
+            &[
+                CMP_W9_W1,
+                0x5400_0101,
+                MODE_LOAD,
+                0x3500_0068,
+                0,
+                MOV_W8_60F,
+            ],
+        ));
+        let (patched, applied) =
+            with_frame_mode(&twice, MARIO_KART_WORLD, false, MkwFrameMode::Auto);
+        assert_eq!(applied, AppliedPatches::default());
+        assert_eq!(patched.image, twice.image);
+    }
+
+    #[test]
+    fn the_adaptive_frame_mode_needs_room_for_its_stub() {
+        let module = fake_main(&[(TEXT_WORDS - 3, 1)]);
+        let (patched, applied) =
+            with_frame_mode(&module, MARIO_KART_WORLD, false, MkwFrameMode::Auto);
+        assert_eq!(applied, AppliedPatches::default());
+        assert_eq!(patched.image, module.image);
+    }
+
+    #[test]
+    fn an_extracted_title_carries_the_frame_mode_word() {
+        let temp = TempDir::new("mkw-frame-mode");
+        let exefs = temp.0.join("exefs");
+        std::fs::create_dir_all(&exefs).unwrap();
+        std::fs::write(exefs.join("main.npdm"), build_npdm(&NpdmSpec::default())).unwrap();
+        std::fs::write(exefs.join("main"), fake_main_nso(&[])).unwrap();
+        let options = LoadOptions {
+            hashes: HashCheck::Skip,
+            mods: ModOptions {
+                mkw_frame_mode: MkwFrameMode::Auto,
+                ..ModOptions::default()
+            },
+            ..LoadOptions::default()
+        };
+        let image = load(&exefs.join("main"), &options).unwrap();
+        let main = image.module("main").unwrap();
+        let word = image.frame_mode_word.unwrap();
+        let at = (word - main.offset) as usize;
+        assert_eq!(image.present_interval, None);
+        assert_eq!(&main.image[at..at + 4], FRAME_MODE_SIXTY.to_le_bytes());
     }
 }

@@ -19,7 +19,7 @@ use crate::nro::load_nro;
 use crate::nso::{HashCheck, load_nso};
 use crate::nup;
 use crate::package;
-use crate::patch::{ModOptions, Mods};
+use crate::patch::{AppliedPatches, ModOptions, Mods};
 use crate::program::ProgramImage;
 
 /// Icon file languages in NACP title order, so [`NacpLanguage`] indexes them.
@@ -308,9 +308,9 @@ impl LooseTitle {
             .ok_or(LoaderError::MissingNpdm)?;
         let mods = Mods::find(&options.mods, Npdm::parse(&npdm.read_all()?)?.program_id)?;
         let (npdm, mut modules) = load_exefs(mods.layer_exefs(exefs)?.as_ref(), options.hashes)?;
-        let present_interval = mods.patch_modules(&mut modules)?;
+        let patches = mods.patch_modules(&mut modules)?;
         let romfs = mods.layer_romfs(self.romfs()?)?;
-        let mut image = ProgramImage::new(npdm, modules, romfs, self.nacp(), present_interval);
+        let mut image = ProgramImage::new(npdm, modules, romfs, self.nacp(), patches);
         image.icon = self.icon(options.language);
         Ok(image)
     }
@@ -439,7 +439,7 @@ pub fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramImage> {
                 vec![module],
                 None,
                 None,
-                None,
+                AppliedPatches::default(),
             ))
         }
         TitleFormat::Nro => {
@@ -449,8 +449,13 @@ pub fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramImage> {
                 .unwrap_or_default();
             let (module, assets) = load_nro(&HostFile::open(path)?, &name)?;
             let nacp = assets.nacp.and_then(|f| Nacp::read(f.as_ref()).ok());
-            let mut image =
-                ProgramImage::new(Npdm::homebrew(0), vec![module], assets.romfs, nacp, None);
+            let mut image = ProgramImage::new(
+                Npdm::homebrew(0),
+                vec![module],
+                assets.romfs,
+                nacp,
+                AppliedPatches::default(),
+            );
             image.icon = assets.icon.map(|f| f.read_all()).transpose()?;
             Ok(image)
         }
