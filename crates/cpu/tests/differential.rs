@@ -551,6 +551,11 @@ fn fp_zero_factors() {
     );
 }
 alu_class!(fp_min_max, "000111100x1xxxxx01xx10xxxxxxxxxx");
+alu_class!(
+    vector_absolute_difference_accumulate,
+    "0xx01110xx1xxxxx011111xxxxxxxxxx",
+    |w| { (w >> 22) & 3 < 3 }
+);
 alu_class!(fp_compare_vector, "0xx01110xx1xxxxx111001xxxxxxxxxx", |w| {
     matches!(w & 0xbfa0_fc00, 0x0e20_e400 | 0x2e20_e400 | 0x2ea0_e400)
         && w & 0x4040_0000 != 0x0040_0000

@@ -296,11 +296,12 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 31] = [
+const VECTOR: [&str; 32] = [
     "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
     "0xx01110xx1xxxxx000x01xxxxxxxxxx",
     "0xx01110xx1xxxxx00x011xxxxxxxxxx",
     "0xx01110xx1xxxxx011101xxxxxxxxxx",
+    "0xx01110xx1xxxxx011111xxxxxxxxxx",
     "0x001110xx0xxxxx0x1110xxxxxxxxxx",
     "0xx01110xx1xxxxxxxxx00xxxxxxxxxx",
     "0xx01111xxxxxxxxxxxxx0xxxxxxxxxx",
@@ -2427,6 +2428,34 @@ fn run_profiled(
         .profile_counts()
         .map(|p| p.table(1, Duration::ZERO));
     (halt, ctx, table)
+}
+
+#[test]
+fn absolute_difference_accumulate_without_sse41() {
+    let ctx = ThreadContext {
+        pc: CODE,
+        v: std::array::from_fn(|i| {
+            0xff80_0080_7fff_00ff_ffff_0000_7fff_8000u128.rotate_left(i as u32)
+        }),
+        ..Default::default()
+    };
+    for (op, native) in [
+        (0x4e62_7c20, true),  // saba v0.8h, v1.8h, v2.8h
+        (0x2e22_7c20, true),  // uaba v0.8b, v1.8b, v2.8b
+        (0x4ea2_7c20, false), // saba v0.4s, v1.4s, v2.4s
+        (0x6ee2_7c20, false), // unallocated D-lane encoding
+    ] {
+        let mut interpreter = Machine::new(Backend::Interpreter);
+        let expected = interpreter.run(&[op, BRK], &ctx, &vec![0; DATA_SIZE as usize]);
+        let (halt, after, profile) = run_profiled(&[op, BRK], ctx.clone(), true);
+        assert_eq!(halt, expected.halt, "{op:#010x}");
+        assert_eq!(after, expected.ctx, "{op:#010x}");
+        assert_eq!(
+            !profile.unwrap().contains("CallSimd calls:"),
+            native,
+            "{op:#010x}",
+        );
+    }
 }
 
 /// A scalar product, fused product, quotient or narrowing conversion whose result is zero because a

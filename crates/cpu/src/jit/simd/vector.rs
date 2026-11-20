@@ -685,7 +685,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             (0b10001, false, _) => Binary::CmTst,
             (0b00000, _, _) => Binary::Hadd(!u),
             (0b00010, _, _) => Binary::Rhadd(!u),
-            (0b01110, _, _) => Binary::Abd(!u),
+            (0b01110 | 0b01111, _, _) => Binary::Abd(!u),
             (0b10100, _, _) => Binary::MinMaxP {
                 max: true,
                 signed: !u,
@@ -701,6 +701,12 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         }
         let (a, b) = (vec(t, rn), vec(t, rm));
         let r = emit(t, VecOp::Binary(op, arrangement, a, b));
+        let r = if opcode == 0b01111 {
+            let acc = vec(t, rd);
+            emit(t, VecOp::Binary(Binary::Add, arrangement, acc, r))
+        } else {
+            r
+        };
         t.set(Loc::V(rd), r);
         return true;
     }

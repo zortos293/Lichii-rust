@@ -2,9 +2,11 @@
 //!
 //! `cargo bench -p lichii-cpu --bench cpu [names...]`; `LICHII_BENCH_ITERATIONS` sets the loop
 //! count (default 10M, zero is ignored), and names run only the workloads containing one of them.
+//! `LICHII_BENCH_JIT_ONLY=1` skips the interpreter, and `LICHII_BENCH_SOFTWARE_MEMORY=1` skips
+//! the fastmem arena. The Linux x86-64 benchmark reports executing thread CPU time separately.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use lichii_common::settings::{CpuAccuracy, CpuBackend};
 use lichii_cpu::{CpuConfig, GuestClock, HaltReason, ThreadContext, TscScale, new_core};
@@ -40,7 +42,51 @@ struct Workload {
     per_iteration: u64,
 }
 
+const MIXED: [u32; 22] = [
+    0x94000004, // bl job
+    0xf10004a5, // subs x5, x5, #1
+    0x54ffffc1, // b.ne loop
+    0xd4000001, // svc #0
+    0xf8607823, // job: ldr x3, [x1, x0, lsl #3]
+    0x3dc01020, // ldr q0, [x1, #64]
+    0x3dc01421, // ldr q1, [x1, #80]
+    0x3dc01822, // ldr q2, [x1, #96]
+    0x8b030042, // add x2, x2, x3
+    0xca000044, // eor x4, x2, x0
+    0x4ea18403, // add v3.4s, v0.4s, v1.4s
+    0x6e231c44, // eor v4.16b, v2.16b, v3.16b
+    0x4ea47405, // sabd v5.4s, v0.4s, v4.4s
+    0x4ea58426, // add v6.4s, v1.4s, v5.4s
+    0x1e2b2947, // fadd s7, s10, s11
+    0x1e2a08e8, // fmul s8, s7, s10
+    0xf8207824, // str x4, [x1, x0, lsl #3]
+    0x3d801c26, // str q6, [x1, #112]
+    0xbd008028, // str s8, [x1, #128]
+    0x91000400, // add x0, x0, #1
+    0x92402400, // and x0, x0, #0x3ff
+    0xd65f03c0, // ret
+];
+
+const MIXED_ACCUMULATE: [u32; MIXED.len()] = {
+    let mut code = MIXED;
+    code[12] = 0x4ea11c26; // mov v6.16b, v1.16b
+    code[13] = 0x4ea47c06; // saba v6.4s, v0.4s, v4.4s
+    code
+};
+
 const WORKLOADS: &[Workload] = &[
+    Workload {
+        name: "mixed worker",
+        code: &MIXED,
+        far: &[],
+        per_iteration: 21,
+    },
+    Workload {
+        name: "mixed worker accumulate",
+        code: &MIXED_ACCUMULATE,
+        far: &[],
+        per_iteration: 21,
+    },
     Workload {
         name: "alu+memory loop",
         code: &[
@@ -632,7 +678,27 @@ const FLUSH_TO_ZERO: &[&str] = &[
     "fp compare loop",
 ];
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut ts = std::mem::MaybeUninit::uninit();
+    // SAFETY: clock_gettime writes one timespec to its output pointer on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, ts.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the call above succeeded.
+    let ts = unsafe { ts.assume_init() };
+    Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
+}
+
 fn main() {
+    if std::env::var_os("LICHII_JIT_PROFILE").is_some() {
+        lichii_common::init_logging("lichii_cpu::jit::profile=info");
+    }
     let iterations: u64 = std::env::var("LICHII_BENCH_ITERATIONS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -642,6 +708,8 @@ fn main() {
         .skip(1)
         .filter(|a| !a.starts_with('-'))
         .collect();
+    let jit_only = std::env::var_os("LICHII_BENCH_JIT_ONLY").is_some();
+    let software_memory = std::env::var_os("LICHII_BENCH_SOFTWARE_MEMORY").is_some();
     for ((workload, fpcr), backend) in WORKLOADS
         .iter()
         .filter(|w| names.is_empty() || names.iter().any(|n| w.name.contains(n.as_str())))
@@ -650,11 +718,14 @@ fn main() {
             std::iter::once((w, 0)).chain(fz)
         })
         .flat_map(|w| [(w, CpuBackend::Interpreter), (w, CpuBackend::Jit)])
+        .filter(|(_, backend)| !jit_only || *backend == CpuBackend::Jit)
     {
-        let mem = Arc::new(
-            AddressSpace::with_fastmem(Arc::new(PhysicalMemory::new(1 << 20).unwrap()), 39)
-                .unwrap(),
-        );
+        let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+        let mem = Arc::new(if software_memory {
+            AddressSpace::new(physical, 39)
+        } else {
+            AddressSpace::with_fastmem(physical, 39).unwrap()
+        });
         mem.map(CODE, 0, 0x1000, MemoryPermission::READ_EXECUTE);
         mem.map(DATA, 0x1000, 0x2000, MemoryPermission::READ_WRITE);
         mem.map(FAR, 0x3000, 0x1000, MemoryPermission::READ_EXECUTE);
@@ -678,26 +749,54 @@ fn main() {
                 accuracy: CpuAccuracy::Auto,
             },
         );
-        let mut seconds = f64::MAX;
-        for _ in 0..3 {
+        let mut wall_times = [Duration::ZERO; 5];
+        let mut cpu_times = [None; 5];
+        for run in 0..=wall_times.len() {
             let mut ctx = ThreadContext {
                 pc: CODE,
                 fpcr,
                 ..Default::default()
             };
             ctx.x[1] = DATA;
-            ctx.x[5] = iterations;
+            ctx.x[5] = if run == 0 {
+                iterations.min(10_000)
+            } else {
+                iterations
+            };
+            if workload.name.starts_with("mixed worker") {
+                ctx.v[10] = 1.5f32.to_bits().into();
+                ctx.v[11] = 0.37f32.to_bits().into();
+            }
+            let cpu_start = thread_cpu_time();
             let start = Instant::now();
             assert_eq!(core.run(&mut ctx), HaltReason::SupervisorCall(0));
-            seconds = seconds.min(start.elapsed().as_secs_f64());
+            let wall = start.elapsed();
+            if let Some(sample) = run.checked_sub(1) {
+                wall_times[sample] = wall;
+                cpu_times[sample] = cpu_start
+                    .zip(thread_cpu_time())
+                    .and_then(|(a, b)| b.checked_sub(a));
+            }
         }
         let instructions = iterations * workload.per_iteration;
+        wall_times.sort_unstable();
+        cpu_times.sort_unstable();
+        let seconds = wall_times[2].as_secs_f64();
+        let cpu = cpu_times[0]
+            .zip(cpu_times[2])
+            .map(|(_, time)| {
+                format!(
+                    ", {:.3} CPU ns/insn",
+                    time.as_secs_f64() * 1e9 / instructions as f64
+                )
+            })
+            .unwrap_or_default();
         let name = match fpcr {
             0 => workload.name.to_string(),
             _ => format!("{} fz", workload.name),
         };
         println!(
-            "{name:<18} {:<12} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s, best of 3)",
+            "{name:<18} {:<12} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s{cpu}, median of 5)",
             format!("{backend:?}"),
             instructions as f64 / seconds / 1e6
         );
