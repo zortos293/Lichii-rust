@@ -42,11 +42,12 @@ You need:
 
 ### Video (FFmpeg)
 
-Games play their movies through the console's video decoder, which Lichii emulates with FFmpeg's libavcodec. FFmpeg is loaded at runtime and is optional: without it Lichii logs one warning and movies play as black frames. Any FFmpeg 4 to 8 with shared libraries works.
+Games play their movies through the console's video decoder, which Lichii emulates with FFmpeg's libavcodec. Both release builds use the same FFmpeg: a pinned, decoder-only, LGPL-2.1-or-later build (H.264, HEVC, VP8, VP9 and AV1 through dav1d; no GPL or non-free parts) whose sources and configuration live in `scripts/ffmpeg-common.sh`.
 
-- Linux: install your distribution's FFmpeg libraries (`libavcodec60` on Ubuntu 24.04, `ffmpeg-libs` on Fedora).
+- Linux release: FFmpeg is linked into `lichii`, so it needs no FFmpeg installed. The tarball is built in manylinux_2_28 and runs on any distribution with glibc 2.28 or newer and ALSA's `libasound.so.2`. To link it into your own build, run `scripts/build-ffmpeg-linux.sh <dir>` (needs nasm, meson and ninja) and build with `LICHII_FFMPEG_STATIC_DIR=<dir>`, which must be an absolute path.
+- Linux, built from source without `LICHII_FFMPEG_STATIC_DIR`: FFmpeg loads at runtime from your distribution's libraries (`libavcodec60` on Ubuntu 24.04, `ffmpeg-libs` from RPM Fusion on Fedora); any FFmpeg 4 to 8 works. Without it Lichii logs one warning and movies play as black frames.
 - Windows: put `avcodec-61.dll` and `avutil-59.dll` next to `lichii.exe`. The Release workflow's zip has them; to build them yourself, run `scripts/build-ffmpeg-windows.sh <dir>` on Linux or WSL with mingw-w64 and nasm. That build is LGPL-2.1-or-later (decoders only, no GPL or non-free parts) and writes its licence and source note beside the DLLs.
-- `LICHII_FFMPEG_DIR` points Lichii at another folder holding the libraries.
+- `LICHII_FFMPEG_DIR` points a build that loads FFmpeg at runtime at another folder holding the libraries. A build with FFmpeg linked in ignores it.
 
 ### Frame dumps
 

@@ -1,0 +1,30 @@
+name: FFmpeg for Linux
+
+# Builds the static LGPL FFmpeg archives Lichii links on Linux (scripts/build-ffmpeg-linux.sh) in
+# the manylinux_2_28 image the Linux release builds in, so they hold to its glibc 2.28 floor, and
+# uploads them as the ffmpeg-linux artifact. Cached until the scripts or the image change. Keep
+# the image the same as release.yml's.
+
+on:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
+    steps:
+      - uses: actions/checkout@v4
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-linux
+          key: ffmpeg-linux-${{ hashFiles('.github/workflows/ffmpeg-linux.yml', 'scripts/build-ffmpeg-linux.sh', 'scripts/ffmpeg-common.sh', 'scripts/install-manylinux-deps.sh') }}
+      - name: Build FFmpeg
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          scripts/install-manylinux-deps.sh
+          scripts/build-ffmpeg-linux.sh ffmpeg-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-linux
+          path: ffmpeg-linux

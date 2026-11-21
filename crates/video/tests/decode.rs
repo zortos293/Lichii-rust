@@ -1,7 +1,7 @@
 //! Decodes the synthetic streams in tests/data (see generate.py) through FFmpeg.
 //!
-//! The tests need FFmpeg's shared libraries at runtime. They pass without them unless
-//! LICHII_REQUIRE_FFMPEG is set, as CI does.
+//! The tests need FFmpeg, linked in (LICHII_FFMPEG_STATIC_DIR at build time) or as shared
+//! libraries at runtime. They pass without it unless LICHII_REQUIRE_FFMPEG is set, as CI does.
 
 use std::time::Instant;
 

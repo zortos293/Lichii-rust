@@ -1,6 +1,8 @@
 name: Release
 
-# A Windows build of the desktop app with the FFmpeg DLLs it loads next to lichii.exe.
+# A Windows build of the desktop app with the FFmpeg DLLs it loads next to lichii.exe, and a
+# portable Linux build: built in manylinux_2_28 with FFmpeg linked in, so it runs on any
+# distribution with glibc 2.28 or newer (scripts/package-linux.sh checks it).
 
 on:
   workflow_dispatch:
@@ -10,6 +12,9 @@ on:
 jobs:
   ffmpeg-windows:
     uses: ./.github/workflows/ffmpeg-windows.yml
+
+  ffmpeg-linux:
+    uses: ./.github/workflows/ffmpeg-linux.yml
 
   windows:
     needs: ffmpeg-windows
@@ -28,3 +33,26 @@ jobs:
         with:
           name: lichii-windows-x64
           path: dist
+
+  linux:
+    needs: ffmpeg-linux
+    runs-on: ubuntu-latest
+    # Keep the image the same as ffmpeg-linux.yml's.
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/install-manylinux-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-linux
+          path: ffmpeg-linux
+      # In a container job ${{ github.workspace }} is the host's path; $GITHUB_WORKSPACE is the
+      # container's.
+      - run: LICHII_FFMPEG_STATIC_DIR="$GITHUB_WORKSPACE/ffmpeg-linux" cargo build --release --locked -p lichii
+      - run: scripts/package-linux.sh target/release/lichii ffmpeg-linux dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichii-linux-x64
+          path: dist/lichii-linux-x64.tar.gz

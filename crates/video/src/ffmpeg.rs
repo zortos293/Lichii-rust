@@ -1,16 +1,18 @@
-//! libavcodec and libavutil, loaded at runtime.
+//! libavcodec and libavutil, linked statically or loaded at runtime.
 //!
-//! Loading at runtime keeps FFmpeg out of the build: the emulator builds without FFmpeg headers,
-//! starts without the libraries, and picks up whichever supported FFmpeg (4.x to 8.x) the system
-//! or the release folder holds. Only ABI-stable parts are touched: functions, the leading fields of
-//! `AVFrame` and `AVPacket` (unchanged since FFmpeg 3), and `AVCodecContext` through AVOptions,
-//! never its layout.
+//! A build with `LICHII_FFMPEG_STATIC_DIR` set (the Linux release, see `build.rs`) links the
+//! decoder-only FFmpeg that `scripts/build-ffmpeg-linux.sh` builds. Any other build keeps FFmpeg
+//! out of the build: it needs no FFmpeg headers, starts without the libraries, and picks up
+//! whichever supported FFmpeg (4.x to 8.x) the system or the release folder holds ([`runtime`]).
+//! Either way only ABI-stable parts are touched: functions, the leading fields of `AVFrame` and
+//! `AVPacket` (unchanged since FFmpeg 3), and `AVCodecContext` through AVOptions, never its
+//! layout.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use libloading::Library;
+#[cfg(not(ffmpeg_static))]
+mod runtime;
 
 /// libavcodec majors this binding supports, newest first, each with the libavutil major it ships
 /// with.
@@ -94,14 +96,39 @@ macro_rules! api {
             $($(pub $name: unsafe extern "C" fn($($arg),*) $(-> $ret)?,)*)*
             pub formats: PixelFormats,
             pub version: (u32, u32),
-            _libraries: Vec<Library>,
+            #[cfg(not(ffmpeg_static))]
+            _libraries: Vec<libloading::Library>,
+        }
+
+        #[cfg(ffmpeg_static)]
+        mod linked {
+            use super::*;
+
+            // SAFETY: each function is declared with the signature FFmpeg's public headers give
+            // it, and build.rs links the FFmpeg those headers belong to.
+            unsafe extern "C" {
+                $($(pub(super) fn $name($(_: $arg),*) $(-> $ret)?;)*)*
+            }
         }
 
         impl Api {
-            fn resolve($($library: Library),*) -> Result<Self, String> {
+            /// The functions of the FFmpeg build.rs linked in.
+            #[cfg(ffmpeg_static)]
+            fn linked() -> Self {
+                Self {
+                    $($($name: linked::$name,)*)*
+                    formats: PixelFormats::default(),
+                    version: (0, 0),
+                }
+                .described()
+            }
+
+            /// The functions of the loaded libraries, or the name of the first one missing.
+            #[cfg(not(ffmpeg_static))]
+            fn resolve($($library: libloading::Library),*) -> Result<Self, String> {
                 // SAFETY: each symbol is declared with the signature FFmpeg's public headers give
                 // it, which every supported major keeps.
-                let mut api = unsafe {
+                let api = unsafe {
                     Self {
                         $($(
                             $name: *$library
@@ -115,18 +142,23 @@ macro_rules! api {
                         _libraries: vec![$($library),*],
                     }
                 };
+                Ok(api.described())
+            }
+
+            /// Fills in the version and the pixel format values.
+            fn described(mut self) -> Self {
                 // SAFETY: version queries and pixel format lookups by NUL-terminated name.
                 unsafe {
-                    let format = |name: &CStr| (api.av_get_pix_fmt)(name.as_ptr());
-                    api.formats = PixelFormats {
+                    let format = |name: &CStr| (self.av_get_pix_fmt)(name.as_ptr());
+                    self.formats = PixelFormats {
                         yuv420p: format(c"yuv420p"),
                         yuvj420p: format(c"yuvj420p"),
                         nv12: format(c"nv12"),
                         yuv420p10le: format(c"yuv420p10le"),
                     };
-                    api.version = ((api.avcodec_version)() >> 16, (api.avutil_version)() >> 16);
+                    self.version = ((self.avcodec_version)() >> 16, (self.avutil_version)() >> 16);
                 }
-                Ok(api)
+                self
             }
         }
     };
@@ -162,7 +194,7 @@ api! {
     }
 }
 
-/// The loaded FFmpeg, or `None` (after one warning) when no supported FFmpeg is installed.
+/// The FFmpeg in use, or `None` (after one warning) when no supported FFmpeg is installed.
 pub(crate) fn api() -> Option<&'static Api> {
     static API: OnceLock<Option<Api>> = OnceLock::new();
     API.get_or_init(|| match load() {
@@ -175,149 +207,37 @@ pub(crate) fn api() -> Option<&'static Api> {
             // SAFETY: a plain setter of FFmpeg's global log level.
             unsafe { (api.av_log_set_level)(level) };
             tracing::info!(
-                "video: FFmpeg libavcodec {} / libavutil {} loaded",
+                "video: FFmpeg libavcodec {} / libavutil {} {}",
                 api.version.0,
-                api.version.1
+                api.version.1,
+                if cfg!(ffmpeg_static) {
+                    "linked"
+                } else {
+                    "loaded"
+                }
             );
             Some(api)
         }
-        Err(tried) => {
-            let folders = search_dirs()
-                .iter()
-                .map(|dir| dir.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let (codec, util) = (library_name("avcodec", 61), library_name("avutil", 59));
-            tracing::warn!(
-                "video: FFmpeg not found, so videos play as black frames. Put the FFmpeg 4 to 8 \
-                 shared libraries ({codec} and {util}, or another matching pair) in one of: \
-                 {folders}. LICHII_FFMPEG_DIR names a folder that is searched first. ({tried})"
-            );
+        Err(why) => {
+            tracing::warn!("video: FFmpeg not found, so videos play as black frames. {why}");
             None
         }
     })
     .as_ref()
 }
 
-fn library_name(name: &str, major: u32) -> String {
-    if cfg!(windows) {
-        format!("{name}-{major}.dll")
-    } else if cfg!(target_os = "macos") {
-        format!("lib{name}.{major}.dylib")
-    } else {
-        format!("lib{name}.so.{major}")
-    }
-}
-
-/// The folders FFmpeg is looked for in, in order: `env` (`LICHII_FFMPEG_DIR`), the executable's
-/// folder, then `ffmpeg` in the user data folder. The system's library search path comes after
-/// them.
-fn ordered_dirs(env: Option<PathBuf>, exe_dir: Option<PathBuf>, user_dir: &Path) -> Vec<PathBuf> {
-    env.into_iter()
-        .chain(exe_dir)
-        .chain([user_dir.join("ffmpeg")])
-        .collect()
-}
-
-fn search_dirs() -> Vec<PathBuf> {
-    ordered_dirs(
-        std::env::var_os("LICHII_FFMPEG_DIR").map(PathBuf::from),
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(PathBuf::from)),
-        &lichii_common::paths::UserPaths::discover().data_dir,
-    )
-}
-
-/// Opens `name` from the first of `dirs` that holds a loadable copy, else from the system's
-/// library search path. avutil loads before avcodec, so avcodec's import of it resolves to the
-/// copy already loaded, wherever that came from.
-fn open(name: &str, dirs: &[PathBuf]) -> Option<Library> {
-    dirs.iter()
-        .map(|dir| dir.join(name))
-        .filter(|path| path.is_file())
-        .chain([PathBuf::from(name)])
-        .find_map(|path| load_library(&path))
-}
-
-#[cfg(windows)]
-fn load_library(path: &Path) -> Option<Library> {
-    use libloading::os::windows::{LOAD_WITH_ALTERED_SEARCH_PATH, Library as WindowsLibrary};
-    let flags = if path.is_absolute() {
-        LOAD_WITH_ALTERED_SEARCH_PATH
-    } else {
-        0
-    };
-    // SAFETY: loading FFmpeg runs only its library initialisers, which have no preconditions. The
-    // altered search path lets the libraries FFmpeg imports (swresample, ...) load from its folder.
-    unsafe { WindowsLibrary::load_with_flags(path, flags) }
-        .ok()
-        .map(Library::from)
-}
-
-#[cfg(not(windows))]
-fn load_library(path: &Path) -> Option<Library> {
-    // SAFETY: loading FFmpeg runs only its library initialisers, which have no preconditions.
-    unsafe { Library::new(path) }.ok()
-}
-
+#[cfg(ffmpeg_static)]
 fn load() -> Result<Api, String> {
-    let dirs = search_dirs();
-    let mut tried = Vec::new();
-    for (codec_major, util_major) in MAJORS {
-        let (codec_name, util_name) = (
-            library_name("avcodec", codec_major),
-            library_name("avutil", util_major),
-        );
-        let Some(avutil) = open(&util_name, &dirs) else {
-            tried.push(util_name);
-            continue;
-        };
-        let Some(avcodec) = open(&codec_name, &dirs) else {
-            tried.push(codec_name);
-            continue;
-        };
-        let api = Api::resolve(avcodec, avutil)?;
-        if api.version != (codec_major, util_major) {
-            return Err(format!(
-                "{codec_name} reports libavcodec {} / libavutil {}",
-                api.version.0, api.version.1
-            ));
-        }
-        return Ok(api);
-    }
-    Err(format!("tried {}", tried.join(", ")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_env_folder_comes_first_then_the_executable_then_the_user_folder() {
-        let user = Path::new("/home/someone/.local/share/lichii");
-        let dirs = ordered_dirs(
-            Some("/opt/ffmpeg".into()),
-            Some("/apps/lichii".into()),
-            user,
-        );
-        assert_eq!(
-            dirs,
-            [
-                PathBuf::from("/opt/ffmpeg"),
-                PathBuf::from("/apps/lichii"),
-                user.join("ffmpeg"),
-            ]
-        );
-    }
-
-    #[test]
-    fn without_the_env_var_the_executable_folder_leads() {
-        let user = Path::new("/profile");
-        assert_eq!(
-            ordered_dirs(None, Some("/apps/lichii".into()), user),
-            [PathBuf::from("/apps/lichii"), user.join("ffmpeg")]
-        );
-        assert_eq!(ordered_dirs(None, None, user), [user.join("ffmpeg")]);
+    let api = Api::linked();
+    if MAJORS.contains(&api.version) {
+        Ok(api)
+    } else {
+        Err(format!(
+            "The linked libavcodec {} / libavutil {} is not a pair this binding supports.",
+            api.version.0, api.version.1
+        ))
     }
 }
+
+#[cfg(not(ffmpeg_static))]
+use runtime::load;
